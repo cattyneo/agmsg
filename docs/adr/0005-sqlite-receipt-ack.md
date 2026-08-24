@@ -52,6 +52,21 @@ Status outcomes are mutation-free. Bounded issue and ack are data operations:
 all failures are non-zero with zero stdout and a bounded, non-sensitive stderr.
 No diagnostic contains key bytes or a receipt token.
 
+For a ready store, status has this exact four-line public output; the final
+line is the §1.4 status name:
+
+```
+receipt_schema=1
+store_generation=<32 lower hex>
+key_sha256=<64 lower hex>
+ok
+```
+
+This is the only public identity projection. It lets a caller compare a
+re-init's schema, store generation, and public-key fingerprint without seeing
+key material. Every non-ready result emits only its final status name on
+stdout.
+
 ### Receipt v1 canonical bytes
 
 Issue and ack use one shared canonicalization implementation. Parallel,
@@ -148,11 +163,15 @@ record the nonce, insert the matching `message_read` events, perform exact
 legacy mirrors, and advance the cursor. It exits 0 with zero stdout only after
 commit; every failure rolls back and emits zero stdout.
 
-Successful acknowledgement prunes in the same transaction only nonce rows
-whose `expires_at < transaction_now - 86400`. An exact retained retry reports
-bounded `already_committed`, including after receipt expiry. Once pruned, it
-reports `stale_or_replayed`; it never becomes valid again. Clock rollback
-delays pruning rather than accelerating it.
+Each committed nonce row stores the payload digest, store generation,
+team digest, recipient digest, batch digest, frame digest, receipt expiry, and
+commit time. Successful acknowledgement prunes in the same transaction only
+rows whose `expires_at < transaction_now - 86400`. Before pruning, only an
+exact all-field match reports bounded `already_committed`, including after
+receipt expiry; any mismatch is a refusal. Once pruned, it reports
+`stale_or_replayed`; it never becomes valid again. Rollback or any failed
+acknowledgement never prunes. Clock rollback delays pruning rather than
+accelerating it.
 
 ### Initialization, filesystem, and platform boundaries
 
@@ -161,16 +180,25 @@ generation, schema, or nonce state. Read, issue, ack, and status never repair,
 rotate, or initialize absent/suspect state. Re-init preserves a complete valid
 identity.
 
-The receipt directory is non-symlink, owner-owned, and `0700`. Key files and
-the SQLite DB are non-symlink, regular, owner-owned, single-link files; keys
-are `0600`, and the DB and parent storage directory have no group/world write
-bit. Half keys, replacement, hard link, symlink, owner/mode, fingerprint, or
-generation mismatch fails closed. Status, issue, and ack check identity before
-use; ack repeats it under its operation lock before opening SQLite. Same-owner
-replacement outside that lock and complete-store clone detection are not
-claimed.
+The receipt state layout is fixed under the selected SQLite storage directory:
+`receipt-v1/private.pem`, `receipt-v1/public.pem`, and `receipt-v1/init.lock`.
+The receipt directory is non-symlink, owner-owned, and `0700`. The parent
+storage directory itself is also non-symlink and owner-owned, with no
+group/world write bit. Key files and the SQLite DB are non-symlink, regular,
+owner-owned, single-link files; keys are `0600`, and the DB has no
+group/world write bit. Half keys, replacement, hard link, symlink, owner/mode,
+fingerprint, or generation mismatch fails closed. Status, issue, and ack check
+all identities before use; ack repeats them under its operation lock immediately
+before opening SQLite. Same-owner replacement outside that lock and complete-store
+clone detection are not claimed.
 
-Init creates a complete adjacent `0600` staging record:
+POSIX does not permit unprivileged hard links to directories, so the hard-link
+requirement applies to regular DB/key/lock records; directory hard-link
+attempts are not a meaningful portable test case. Directory symlink, owner,
+and mode checks remain mandatory.
+
+Init creates a complete `0600` `receipt-v1/.init-stage.<owner_nonce>` staging
+record before linking it to the fixed `receipt-v1/init.lock` name:
 
 ```
 pid=<decimal>
@@ -178,23 +206,33 @@ owner_nonce=<32 lower hex>
 created_at=<epoch>
 ```
 
-It atomically hard-links that closed file to the fixed lock name. Contenders
-wait at most 100 × 50 ms. A valid live PID is never reclaimed. While the
-acquirer has not yet removed the staging name, link count two is valid only if
-that sibling has the same device/inode and exact record. A valid dead owner may
-have both validated names removed and the lock reacquired; malformed,
-misowned, mis-moded, unexpectedly linked, or inode-mismatched state is
-`corrupt_state` and is never automatically removed. Traps remove only the
-caller's still-matching inode/nonce names. SIGKILL or host crash is recovered
-only by the next validated dead-owner reclaim; a pre-link crash grants no lock.
-After acquiring or reclaiming, init rechecks complete state before writing.
+It atomically hard-links that closed file to the fixed lock name, then
+immediately unlinks its exact staging pathname. Contenders wait at most
+100 × 50 ms. A valid live PID is never reclaimed, regardless of apparent age.
+While the acquirer has not yet removed the staging name, link count two is
+valid only if that sibling has the same device/inode and exact record. A valid
+dead owner may have both validated names removed and the lock reacquired;
+malformed, misowned, mis-moded, unexpectedly linked, or inode-mismatched state
+is `corrupt_state` and is never automatically removed. Dead pre-link staging
+files may be removed only after the same exact-record, same-inode, dead-PID
+validation; they never grant a lock. PID reuse is conservatively treated as
+live/unknown and requires manual recovery. Traps remove only the caller's
+still-matching inode/nonce names. SIGKILL or host crash is recovered only by
+the next validated dead-owner reclaim: pre-link leaves a validated staging
+record, post-link/pre-unlink leaves the validated two-link pair, and
+post-acquisition leaves the valid fixed lock. After acquiring or reclaiming,
+init rechecks complete state before writing.
 
-OpenSSL 3 and `xxd` are mandatory runtime dependencies. Git Bash/Windows is
-unsupported for receipt init, issue, and ack until owner-only ACL equivalence
-is proven; those receipt operations fail closed while legacy and bounded
-read-only behavior remains supported. Receipt lifetime depends on wall clock:
-rollback before `issued_at` fails closed, but stateless receipts do not prove
-permanent historical expiry after arbitrary clock rollback.
+OpenSSL 3 and `xxd` are mandatory runtime dependencies. The receipt-only
+`AGMSG_RECEIPT_OPENSSL` and `AGMSG_RECEIPT_XXD` overrides, when set, must each
+be an absolute executable path and receive the same capability probes as the
+platform candidates; an unavailable, non-v3, or incapable override is
+`missing_deps` and cannot fall back. Git Bash/Windows is unsupported for
+receipt init, issue, and ack until owner-only ACL equivalence is proven; those
+receipt operations fail closed while legacy and bounded read-only behavior
+remains supported. Receipt lifetime depends on wall clock: rollback before
+`issued_at` fails closed, but stateless receipts do not prove permanent
+historical expiry after arbitrary clock rollback.
 
 ## Consequences
 
