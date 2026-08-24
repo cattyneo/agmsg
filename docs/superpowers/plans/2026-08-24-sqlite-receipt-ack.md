@@ -269,8 +269,15 @@ OpenSSL 3, `xxd`, and the existing storage facade.
    creating or repairing anything.
 4. Implement the exact Task 1 capability grammar and shared closed claim
    predicate. Do not invent a second registry or ad-hoc grep.
-5. Run the key/runtime suite (GREEN), `/bin/bash -n` on new/changed shell, and
-   existing bounded/storage suites to prove initialization remains opt-in.
+5. Split the Task 1 RED guards by the smallest operation under test: init/status
+   cases require only the state ABI, issuance cases require the issue surface,
+   and acknowledgement cases require `storage_ack_receipt`. This keeps later
+   tasks genuinely RED without forcing placeholder issue/ack implementations or
+   premature capability advertisement. Run the Task 2 state/runtime subset
+   GREEN, keep Task 3/4 cases RED for their missing operation, run `/bin/bash -n`
+   on new/changed shell, and run existing bounded/storage suites to prove
+   initialization remains opt-in. Advertise the complete receipt capability
+   only after Tasks 3 and 4 are implemented and green.
 
 ## Task 3: Add stateless receipt issuance to bounded SQLite reads
 
