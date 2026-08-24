@@ -2,7 +2,9 @@
 
 **Status:** proposed
 **Date:** 2026-08-24
-**Deciders:** @fujibee
+**Deciders:** cattyneo fork owner (`cattyneo/.agents#211`)
+
+This fork-local proposed decision is not an upstream acceptance or approval.
 
 ## Context
 

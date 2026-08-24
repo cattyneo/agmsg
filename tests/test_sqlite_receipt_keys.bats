@@ -8,6 +8,10 @@ load test_helper
 
 setup() {
   setup_test_env
+  TEST_OWNED_PIDS=''
+  DIAGNOSTIC_SENTINEL='receipt-v1.diag-sentinel_7a6e19f4'
+  DIAGNOSTIC_SECRET_FRAGMENT='headerless-secret-fragment-91bc4e72'
+  export DIAGNOSTIC_SENTINEL DIAGNOSTIC_SECRET_FRAGMENT
   export SKILL_DIR="$TEST_SKILL_DIR"
   export AGMSG_STORAGE_DRIVER=sqlite
   export AGMSG_STORAGE_PATH="$BATS_TEST_TMPDIR/store"
@@ -17,7 +21,71 @@ setup() {
   storage_init receipts >/dev/null
 }
 
-teardown() { teardown_test_env; }
+test_process_identity() {
+  ps -p "$1" -o lstart= -o command= 2>/dev/null | sed 's/^ *//'
+}
+
+register_test_pid() {
+  local pid="$1" identity
+  identity="$(test_process_identity "$pid")"
+  # A process that has already exited needs no cleanup entry; an extant one
+  # must have a recorded start-time/command identity before the test proceeds.
+  if [ -z "$identity" ]; then
+    kill -0 "$pid" 2>/dev/null && return 1
+    return 0
+  fi
+  TEST_OWNED_PIDS="${TEST_OWNED_PIDS}${pid}"$'\t'"${identity}"$'\n'
+}
+
+unregister_test_pid() {
+  local pid="$1"
+  TEST_OWNED_PIDS="$(printf '%s' "$TEST_OWNED_PIDS" | awk -F '\t' -v pid="$pid" '$1 != pid')"
+  [ -z "$TEST_OWNED_PIDS" ] || TEST_OWNED_PIDS="${TEST_OWNED_PIDS}"$'\n'
+}
+
+registered_pid_matches() {
+  local target="$1" pid identity current
+  while IFS=$'\t' read -r pid identity; do
+    [ "$pid" = "$target" ] || continue
+    current="$(test_process_identity "$pid")"
+    [ "$current" = "$identity" ] && return 0
+  done <<EOF
+$TEST_OWNED_PIDS
+EOF
+  return 1
+}
+
+release_test_waiters() {
+  [ -n "${RECEIPT_CRASH_RELEASE:-}" ] && : >"$RECEIPT_CRASH_RELEASE"
+}
+
+cleanup_test_processes() {
+  local pid identity current
+  release_test_waiters
+  while IFS=$'\t' read -r pid identity; do
+    [ -n "$pid" ] || continue
+    current="$(test_process_identity "$pid")"
+    [ "$current" = "$identity" ] || continue
+    kill "$pid" 2>/dev/null || true
+  done <<EOF
+$TEST_OWNED_PIDS
+EOF
+  while IFS=$'\t' read -r pid identity; do
+    [ -n "$pid" ] || continue
+    current="$(test_process_identity "$pid")"
+    [ "$current" = "$identity" ] || continue
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done <<EOF
+$TEST_OWNED_PIDS
+EOF
+  TEST_OWNED_PIDS=''
+}
+
+teardown() {
+  cleanup_test_processes
+  teardown_test_env
+}
 
 store_dir() { dirname "$(agmsg_db_path receipts)"; }
 
@@ -134,15 +202,20 @@ assert_safe_diagnostics() {
   [ "$(wc -c <"$CAPTURE_STDOUT" | tr -d ' ')" -le 4096 ]
   [ "$(wc -c <"$CAPTURE_STDERR" | tr -d ' ')" -le 4096 ]
   ! grep -Eq -- '-----BEGIN|PRIVATE KEY|PUBLIC KEY' "$CAPTURE_STDOUT" "$CAPTURE_STDERR"
+  ! grep -Fq -- "$DIAGNOSTIC_SENTINEL" "$CAPTURE_STDOUT" "$CAPTURE_STDERR"
+  ! grep -Fq -- "$DIAGNOSTIC_SECRET_FRAGMENT" "$CAPTURE_STDOUT" "$CAPTURE_STDERR"
   if [ -n "$forbidden" ]; then
     ! grep -Fq -- "$forbidden" "$CAPTURE_STDOUT" "$CAPTURE_STDERR"
   fi
 }
 
 dead_pid() {
-  ( exit 0 ) &
+  sleep 1 &
   local pid=$!
+  register_test_pid "$pid"
+  registered_pid_matches "$pid" && kill "$pid" 2>/dev/null || true
   wait "$pid"
+  unregister_test_pid "$pid"
   printf '%s' "$pid"
 }
 
@@ -230,32 +303,37 @@ start_crashable_init() {
     storage_receipt_init receipts >"$BATS_TEST_TMPDIR/crash-init.stdout" \
     2>"$BATS_TEST_TMPDIR/crash-init.stderr" &
   RECEIPT_INIT_PID=$!
+  register_test_pid "$RECEIPT_INIT_PID"
   local attempt
   for attempt in $(seq 1 100); do
     if [ -s "$RECEIPT_CRASH_MARKER" ]; then
       CRASH_WRAPPER_PID="$(awk -F= '$1 == "wrapper_pid" { print $2 }' "$RECEIPT_CRASH_MARKER")"
-      [ -n "$CRASH_WRAPPER_PID" ] && kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null && return 0
+      if [ -n "$CRASH_WRAPPER_PID" ] && kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null; then
+        register_test_pid "$CRASH_WRAPPER_PID"
+        return 0
+      fi
     fi
     kill -0 "$RECEIPT_INIT_PID" 2>/dev/null || break
     sleep 0.05
   done
-  kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
+  registered_pid_matches "$RECEIPT_INIT_PID" && kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
   wait "$RECEIPT_INIT_PID" 2>/dev/null || true
+  unregister_test_pid "$RECEIPT_INIT_PID"
   false
 }
 
 kill_crashable_init() {
   [ -s "$RECEIPT_CRASH_MARKER" ]
-  kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
-  kill -9 "$CRASH_WRAPPER_PID" 2>/dev/null || true
+  registered_pid_matches "$RECEIPT_INIT_PID" && kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
+  registered_pid_matches "$CRASH_WRAPPER_PID" && kill -9 "$CRASH_WRAPPER_PID" 2>/dev/null || true
   wait "$RECEIPT_INIT_PID" 2>/dev/null || true
-  local attempt
-  for attempt in $(seq 1 20); do
-    kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null || break
-    read -r -t 0.05 _ </dev/null || true
-  done
+  # Bash 3.2 has integer-only `read -t`; one bounded second is sufficient
+  # after SIGKILL and avoids a fractional-timeout compatibility dependency.
+  sleep 1
   ! kill -0 "$RECEIPT_INIT_PID" 2>/dev/null
   ! kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null
+  unregister_test_pid "$RECEIPT_INIT_PID"
+  unregister_test_pid "$CRASH_WRAPPER_PID"
 }
 
 assert_crash_marker() {
@@ -338,12 +416,16 @@ assert_crash_marker() {
   local first="$BATS_TEST_TMPDIR/first" second="$BATS_TEST_TMPDIR/second"
   storage_receipt_init receipts >"$first" 2>&1 &
   local first_pid=$!
+  register_test_pid "$first_pid"
   storage_receipt_init receipts >"$second" 2>&1 &
   local second_pid=$!
+  register_test_pid "$second_pid"
   wait "$first_pid"
   [ "$?" -eq 0 ]
+  unregister_test_pid "$first_pid"
   wait "$second_pid"
   [ "$?" -eq 0 ]
+  unregister_test_pid "$second_pid"
   [ "$(cat "$first")" = ok ]
   [ "$(cat "$second")" = ok ]
   assert_ready_identity
@@ -735,12 +817,14 @@ assert_crash_marker() {
   lock="$(receipt_lock)"
   sleep 30 &
   local owner_pid=$!
+  register_test_pid "$owner_pid"
   write_lock_record "$lock" "$owner_pid" "$nonce"
   run --separate-stderr storage_receipt_init receipts
   assert_status 13 runtime_error
   [ -f "$lock" ]
-  kill "$owner_pid" 2>/dev/null || true
+  registered_pid_matches "$owner_pid" && kill "$owner_pid" 2>/dev/null || true
   wait "$owner_pid" 2>/dev/null || true
+  unregister_test_pid "$owner_pid"
 }
 
 @test "malformed init lock is corrupt state and is never removed" {
@@ -774,6 +858,7 @@ assert_crash_marker() {
   lock="$(receipt_lock)"
   sleep 30 &
   local owner_pid=$!
+  register_test_pid "$owner_pid"
   write_lock_record "$lock" "$owner_pid" "$nonce"
   started="$(date +%s)"
   run --separate-stderr storage_receipt_init receipts
@@ -781,8 +866,9 @@ assert_crash_marker() {
   assert_status 13 runtime_error
   [ "$elapsed" -le 7 ]
   [ -f "$lock" ]
-  kill "$owner_pid" 2>/dev/null || true
+  registered_pid_matches "$owner_pid" && kill "$owner_pid" 2>/dev/null || true
   wait "$owner_pid" 2>/dev/null || true
+  unregister_test_pid "$owner_pid"
 }
 
 # These require a POSIX runner with executable command-shadowing semantics;
