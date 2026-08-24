@@ -172,41 +172,49 @@ receipt_test_openssl() {
 }
 
 # These wrappers exercise actual initializer processes at crash boundaries. They
-# are test-side PATH/override commands, not production hooks. Each wrapper
-# pauses only after it has observed the named public filesystem milestone.
+# are test-side PATH/override commands, not production hooks. A marker names
+# the paused wrapper PID, exact point, and exact receipt path; no probe command
+# can create one. `read -t` keeps the wrapper paused without spawning a sleep
+# child that could outlive the killed initializer.
 make_crash_wrappers() {
   local wrapper_dir="$BATS_TEST_TMPDIR/receipt-crash-bin"
   mkdir -p "$wrapper_dir"
   export RECEIPT_CRASH_MARKER="$BATS_TEST_TMPDIR/receipt-crash.marker"
   export RECEIPT_CRASH_RELEASE="$BATS_TEST_TMPDIR/receipt-crash.release"
+  export RECEIPT_PRIVATE_PATH="$(receipt_private_key)"
+  export RECEIPT_PUBLIC_PATH="$(receipt_public_key)"
+  export RECEIPT_LOCK_PATH="$(receipt_lock)"
+  export RECEIPT_DB_PATH="$(agmsg_db_path receipts)"
   export RECEIPT_REAL_LN="$(command -v ln)"
   export RECEIPT_REAL_OPENSSL="$(receipt_test_openssl)"
   export RECEIPT_REAL_SQLITE="$(command -v sqlite3)"
 
   printf '%s\n' '#!/bin/bash' \
-    'pause() { : >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do sleep 0.05; done; }' \
-    'if [ "${RECEIPT_CRASH_POINT:-}" = pre-link ]; then pause; fi' \
+    'pause() { umask 077; printf "point=%s\nwrapper_pid=%s\ntarget=%s\n" "$1" "$$" "$2" >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do read -r -t 1 _ </dev/null || true; done; }' \
+    'target="${!#}"' \
+    'if [ "${RECEIPT_CRASH_POINT:-}" = pre-link ] && [ "$target" = "$RECEIPT_LOCK_PATH" ]; then pause pre-link "$target"; fi' \
     '"$RECEIPT_REAL_LN" "$@"' \
     'rc=$?' \
-    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = post-link-before-unlink ]; then pause; fi' \
+    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = post-link-before-unlink ] && [ "$target" = "$RECEIPT_LOCK_PATH" ]; then pause post-link-before-unlink "$target"; fi' \
     'exit "$rc"' >"$wrapper_dir/ln"
   printf '%s\n' '#!/bin/bash' \
-    'pause() { : >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do sleep 0.05; done; }' \
-    'is_genpkey=no; is_public=no' \
-    'for arg in "$@"; do [ "$arg" = genpkey ] && is_genpkey=yes; [ "$arg" = -pubout ] && is_public=yes; done' \
-    'if [ "$is_genpkey" = yes ] && { [ "${RECEIPT_CRASH_POINT:-}" = directory-created ] || [ "${RECEIPT_CRASH_POINT:-}" = after-acquisition ]; }; then pause; fi' \
-    '"$RECEIPT_REAL_OPENSSL" "$@"' \
+    'pause() { umask 077; printf "point=%s\nwrapper_pid=%s\ntarget=%s\n" "$1" "$$" "$2" >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do read -r -t 1 _ </dev/null || true; done; }' \
+    'args=("$@"); command="$1"; out=; in=; is_public=no; shift || true' \
+    'while [ "$#" -gt 0 ]; do case "$1" in -out) shift; out="${1:-}" ;; -in) shift; in="${1:-}" ;; -pubout) is_public=yes ;; esac; shift || true; done' \
+    'is_private=no; [ "$command" = genpkey ] && [ "$out" = "$RECEIPT_PRIVATE_PATH" ] && is_private=yes' \
+    'is_exact_public=no; [ "$command" = pkey ] && [ "$in" = "$RECEIPT_PRIVATE_PATH" ] && [ "$out" = "$RECEIPT_PUBLIC_PATH" ] && [ "$is_public" = yes ] && is_exact_public=yes' \
+    'if [ "$is_private" = yes ] && { [ "${RECEIPT_CRASH_POINT:-}" = directory-created ] || [ "${RECEIPT_CRASH_POINT:-}" = after-acquisition ]; }; then pause "${RECEIPT_CRASH_POINT}" "$out"; fi' \
+    '"$RECEIPT_REAL_OPENSSL" "${args[@]}"' \
     'rc=$?' \
-    'if [ "$rc" -eq 0 ] && [ "$is_genpkey" = yes ] && [ "${RECEIPT_CRASH_POINT:-}" = private-created ]; then pause; fi' \
-    'if [ "$rc" -eq 0 ] && [ "$is_public" = yes ] && [ "${RECEIPT_CRASH_POINT:-}" = public-created ]; then pause; fi' \
+    'if [ "$rc" -eq 0 ] && [ "$is_private" = yes ] && [ "${RECEIPT_CRASH_POINT:-}" = private-created ]; then pause private-created "$out"; fi' \
+    'if [ "$rc" -eq 0 ] && [ "$is_exact_public" = yes ] && [ "${RECEIPT_CRASH_POINT:-}" = public-created ]; then pause public-created "$out"; fi' \
     'exit "$rc"' >"$wrapper_dir/openssl"
   printf '%s\n' '#!/bin/bash' \
-    'pause() { : >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do sleep 0.05; done; }' \
+    'pause() { umask 077; printf "point=%s\nwrapper_pid=%s\ntarget=%s\n" "$1" "$$" "$2" >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do read -r -t 1 _ </dev/null || true; done; }' \
     '"$RECEIPT_REAL_SQLITE" "$@"' \
     'rc=$?' \
-    'db="${AGMSG_STORAGE_PATH}/messages.db"' \
-    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = schema-created ] && [ -f "$db" ] && [ "$("$RECEIPT_REAL_SQLITE" "$db" "SELECT COUNT(*) FROM sqlite_master WHERE type=char(116)||char(97)||char(98)||char(108)||char(101) AND name=char(114)||char(101)||char(99)||char(101)||char(105)||char(112)||char(116)||char(95)||char(109)||char(101)||char(116)||char(97);" 2>/dev/null)" = 1 ]; then pause; fi' \
-    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = generation-created ] && [ -f "$db" ] && "$RECEIPT_REAL_SQLITE" "$db" "SELECT value FROM receipt_meta WHERE key=char(115)||char(116)||char(111)||char(114)||char(101)||char(95)||char(103)||char(101)||char(110)||char(101)||char(114)||char(97)||char(116)||char(105)||char(111)||char(110);" 2>/dev/null | grep -Eq "^[0-9a-f]{32}$"; then pause; fi' \
+    'rows="$("$RECEIPT_REAL_SQLITE" "$RECEIPT_DB_PATH" "SELECT COUNT(*) FROM receipt_meta WHERE key IN (char(115)||char(99)||char(104)||char(101)||char(109)||char(97)||char(95)||char(118)||char(101)||char(114)||char(115)||char(105)||char(111)||char(110), char(115)||char(116)||char(111)||char(114)||char(101)||char(95)||char(103)||char(101)||char(110)||char(101)||char(114)||char(97)||char(116)||char(105)||char(111)||char(110), char(112)||char(117)||char(98)||char(108)||char(105)||char(99)||char(95)||char(107)||char(101)||char(121)||char(95)||char(115)||char(104)||char(97)||char(50)||char(53)||char(54));" 2>/dev/null)"' \
+    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = metadata-committed ] && [ "$rows" = 3 ]; then pause metadata-committed "$RECEIPT_DB_PATH"; fi' \
     'exit "$rc"' >"$wrapper_dir/sqlite3"
   chmod 700 "$wrapper_dir/ln" "$wrapper_dir/openssl" "$wrapper_dir/sqlite3"
   RECEIPT_CRASH_BIN="$wrapper_dir"
@@ -224,7 +232,10 @@ start_crashable_init() {
   RECEIPT_INIT_PID=$!
   local attempt
   for attempt in $(seq 1 100); do
-    [ -e "$RECEIPT_CRASH_MARKER" ] && return 0
+    if [ -s "$RECEIPT_CRASH_MARKER" ]; then
+      CRASH_WRAPPER_PID="$(awk -F= '$1 == "wrapper_pid" { print $2 }' "$RECEIPT_CRASH_MARKER")"
+      [ -n "$CRASH_WRAPPER_PID" ] && kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null && return 0
+    fi
     kill -0 "$RECEIPT_INIT_PID" 2>/dev/null || break
     sleep 0.05
   done
@@ -234,9 +245,25 @@ start_crashable_init() {
 }
 
 kill_crashable_init() {
-  kill -9 "$RECEIPT_INIT_PID"
-  wait "$RECEIPT_INIT_PID" 2>/dev/null || true
   [ -s "$RECEIPT_CRASH_MARKER" ]
+  kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
+  kill -9 "$CRASH_WRAPPER_PID" 2>/dev/null || true
+  wait "$RECEIPT_INIT_PID" 2>/dev/null || true
+  local attempt
+  for attempt in $(seq 1 20); do
+    kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null || break
+    read -r -t 0.05 _ </dev/null || true
+  done
+  ! kill -0 "$RECEIPT_INIT_PID" 2>/dev/null
+  ! kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null
+}
+
+assert_crash_marker() {
+  local expected_point="$1" expected_target="$2"
+  [ "$(awk -F= '$1 == "point" { print $2 }' "$RECEIPT_CRASH_MARKER")" = "$expected_point" ]
+  [ "$(awk -F= '$1 == "target" { print $2 }' "$RECEIPT_CRASH_MARKER")" = "$expected_target" ]
+  [[ "$CRASH_WRAPPER_PID" =~ ^[0-9]+$ ]]
+  kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null
 }
 
 @test "receipt vectors are complete, byte-stable, and distinguish each bound field" {
@@ -771,6 +798,7 @@ skip_unless_posix_crash_runner() {
   assert_receipt_abi
   skip_unless_posix_crash_runner
   start_crashable_init pre-link
+  assert_crash_marker pre-link "$(receipt_lock)"
   kill_crashable_init
   [ -d "$(receipt_dir)" ]
   [ -n "$(find "$(receipt_dir)" -maxdepth 1 -name '.init-stage.*' -print -quit)" ]
@@ -781,6 +809,7 @@ skip_unless_posix_crash_runner() {
   assert_receipt_abi
   skip_unless_posix_crash_runner
   start_crashable_init post-link-before-unlink
+  assert_crash_marker post-link-before-unlink "$(receipt_lock)"
   kill_crashable_init
   local stage
   stage="$(find "$(receipt_dir)" -maxdepth 1 -name '.init-stage.*' -print -quit)"
@@ -794,6 +823,7 @@ skip_unless_posix_crash_runner() {
   assert_receipt_abi
   skip_unless_posix_crash_runner
   start_crashable_init after-acquisition
+  assert_crash_marker after-acquisition "$(receipt_private_key)"
   kill_crashable_init
   [ -d "$(receipt_dir)" ]
   [ -f "$(receipt_lock)" ]
@@ -805,6 +835,7 @@ skip_unless_posix_crash_runner() {
   assert_receipt_abi
   skip_unless_posix_crash_runner
   start_crashable_init directory-created
+  assert_crash_marker directory-created "$(receipt_private_key)"
   kill_crashable_init
   [ -d "$(receipt_dir)" ]
   [ ! -e "$(receipt_private_key)" ]
@@ -815,6 +846,7 @@ skip_unless_posix_crash_runner() {
   assert_receipt_abi
   skip_unless_posix_crash_runner
   start_crashable_init private-created
+  assert_crash_marker private-created "$(receipt_private_key)"
   kill_crashable_init
   [ -f "$(receipt_private_key)" ]
   [ ! -e "$(receipt_public_key)" ]
@@ -824,25 +856,19 @@ skip_unless_posix_crash_runner() {
   assert_receipt_abi
   skip_unless_posix_crash_runner
   start_crashable_init public-created
+  assert_crash_marker public-created "$(receipt_public_key)"
   kill_crashable_init
   [ -f "$(receipt_private_key)" ]
   [ -f "$(receipt_public_key)" ]
 }
 
-@test "real SIGKILL after receipt schema creation leaves the private receipt_meta table" {
+@test "real SIGKILL after atomic receipt metadata commit leaves schema and all identity rows" {
   assert_receipt_abi
   skip_unless_posix_crash_runner
-  start_crashable_init schema-created
+  start_crashable_init metadata-committed
+  assert_crash_marker metadata-committed "$(agmsg_db_path receipts)"
   kill_crashable_init
-  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='receipt_meta';" | tr -d '\r')" = 1 ]
-}
-
-@test "real SIGKILL after generation creation leaves the private store generation row" {
-  assert_receipt_abi
-  skip_unless_posix_crash_runner
-  start_crashable_init generation-created
-  kill_crashable_init
-  [[ "$(receipt_meta_value store_generation)" =~ ^[0-9a-f]{32}$ ]]
+  read_receipt_identity
 }
 
 @test "SIGKILL pre-link residue is removed only when its dead staging record validates" {

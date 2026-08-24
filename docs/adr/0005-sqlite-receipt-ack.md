@@ -179,7 +179,10 @@ lowercase hex), and `public_key_sha256` (the 64 lowercase-hex SHA-256 of the
 exact `public.pem` bytes). This schema is state-validation data, not a public
 storage ABI or a status output format. Isolated storage validation may query it
 read-only together with the public-key file hash; production callers use only
-the `ok`/existing-error status vocabulary.
+the `ok`/existing-error status vocabulary. Init creates the `receipt_meta`
+schema and commits all three required rows in one SQLite transaction. A crash
+may expose neither metadata nor this complete committed set; it must not expose
+or accept a partially committed identity.
 The receipt directory is non-symlink, owner-owned, and `0700`. The parent
 storage directory itself is also non-symlink and owner-owned, with no
 group/world write bit. Key files and the SQLite DB are non-symlink, regular,
@@ -224,13 +227,16 @@ init rechecks complete state before writing.
 The crash matrix runs on a POSIX runner with shell command-shadowing, SQLite,
 and OpenSSL 3. It launches a real initializer and test-side wrappers for
 `ln`, OpenSSL, and `sqlite3` pause only at observed filesystem/metadata
-milestones before `SIGKILL`: receipt directory, private key, public key,
-`receipt_meta` schema, store-generation row, pre-link, post-link/pre-unlink,
-and post-acquisition. Native Git Bash cannot provide these POSIX process and
-path semantics, so its unsupported receipt behavior is tested on a native Git
-Bash runner instead. PID reuse likewise needs a PID namespace to induce
-safely; its conservative refusal requires such a runner, and is otherwise a
-documented platform-conditional test.
+milestones before `SIGKILL`: receipt directory, private key, public key, the
+single atomic `receipt_meta` commit (schema plus all three required rows),
+pre-link, post-link/pre-unlink, and post-acquisition. Each marker records its
+exact point, receipt path, and paused wrapper PID; the harness kills and checks
+both initializer and wrapper before asserting the residual state. Native Git
+Bash cannot provide these POSIX process and path semantics, so its unsupported
+receipt behavior is tested on a native Git Bash runner instead. PID reuse
+likewise needs a PID namespace to induce safely; its conservative refusal
+requires such a runner, and is otherwise a documented platform-conditional
+test.
 
 OpenSSL 3 and `xxd` are mandatory runtime dependencies. The receipt-only
 `AGMSG_RECEIPT_OPENSSL` and `AGMSG_RECEIPT_XXD` overrides, when set, must each
