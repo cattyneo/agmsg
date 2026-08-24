@@ -233,9 +233,39 @@ _jsonl_prepare_rotated_generation_locked() {
 # read-cursor migration marker. A bounded read observes an existing log only;
 # the single jq -s invocation is the operation's read snapshot.
 
+_jsonl_bounded_sent_count() {
+  local log="$1" count
+  count="$(set -o pipefail; jq -r '
+    def logical_events:
+      if (type=="object" and .type=="sync_pull_commit") then
+        .messages[]? | select(type=="object" and .status=="imported") |
+        .local_event // empty
+      else . end;
+    logical_events | select(type=="object" and .type=="message_sent") | 1
+  ' "$log" | wc -l | tr -d " ")" || return 1
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$count"
+}
+
 _jsonl_bounded_cursor_ro() {
-  local team="$1" agent="$2" f value normalized
+  local team="$1" agent="$2" f value normalized marker log
+  log="$(_jsonl_log)" || return 1
+  marker="$(_jsonl_read_cursor_marker)" || return 1
+  # Mirror the one-time adoption performed by _jsonl_read_cursor_migrate, but
+  # do not write a marker or cursor from a read-only operation.
+  if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+    _jsonl_bounded_sent_count "$log" || return 1
+    return 0
+  fi
+  [ -f "$marker" ] || {
+    printf 'storage: JSONL cursor marker is not a regular file\n' >&2
+    return 1
+  }
   f="$(_jsonl_read_cursors)"
+  if { [ -e "$f" ] || [ -L "$f" ]; } && [ ! -f "$f" ]; then
+    printf 'storage: JSONL cursor store is not a regular file\n' >&2
+    return 1
+  fi
   [ -f "$f" ] || { printf '0\n'; return 0; }
   value="$(awk -F '\t' -v t="$team" -v a="$agent" '$1==t && $2==a {p=$3}
     END { print (p=="" ? 0 : p) }' "$f")" || return 1
@@ -244,87 +274,111 @@ _jsonl_bounded_cursor_ro() {
 }
 
 _jsonl_bounded_rows_snapshot() {
-  local team="$1" agent="$2" cursor="$3" log="$4"
-  jq -c --arg team "$team" --arg agent "$agent" --argjson cursor "$cursor" -s '
+  local team="$1" agent="$2" cursor="$3" log="$4" max_record="$5"
+  jq -c --arg team "$team" --arg agent "$agent" --argjson cursor "$cursor" \
+    --argjson max_record "$max_record" -s '
     def logical_events: .[] |
-      if .type=="sync_pull_commit" then
-        .messages[]? | select(.status=="imported") | .local_event // empty
+      if (type=="object" and .type=="sync_pull_commit") then
+        .messages[]? | select(type=="object" and .status=="imported") |
+        .local_event // empty
       else . end;
     [logical_events] as $events |
     (reduce $events[] as $e ({};
-      if ($e|type)=="object" and $e.type=="message_read"
-         and $e.team==$team and $e.agent==$agent
-      then .[$e.msg_id]=true else . end)) as $read |
-    [$events | to_entries[]
-      | select((.key + 1) > $cursor
-          and (.value|type)=="object"
-          and .value.type=="message_sent"
-          and .value.team==$team and .value.to==$agent
-          and (($read[.value.id] // false) | not))
-      | .value
-      | {type:"message_sent",id:.id,team:.team,from:.from,to:.to,body:.body,at:.at}]
-    as $rows |
-    if all($rows[];
-      (.id|type)=="string" and (.team|type)=="string"
-      and (.from|type)=="string" and (.to|type)=="string"
-      and (.body|type)=="string" and (.at|type)=="string")
-    then $rows[]
-    else error("invalid bounded message envelope")
+      if (type=="object" and $e.type=="message_read"
+          and $e.team==$team and $e.agent==$agent)
+      then .[($e.msg_id|tostring)]=true else . end)) as $read |
+    ([$events[] | select(type=="object" and .type=="message_sent")]
+      | to_entries
+      | map({type:"message_sent",id:.value.id,team:.value.team,
+             from:.value.from,to:.value.to,body:.value.body,at:.value.at,
+             delivery_ord:(.key+1)})) as $sent |
+    ([$sent[]
+      | select(.delivery_ord > $cursor and .team==$team and .to==$agent
+          and (($read[(.id|tostring)] // false) | not))
+      | {type,id,team,from,to,body,at,delivery_ord}
+    ] | sort_by([.at,.delivery_ord])) as $rows |
+    if (([$rows[] | .id] | unique | length) != ($rows|length)
+        or any($rows[];
+          (.id|type)!="string" or (.team|type)!="string"
+          or (.from|type)!="string" or (.to|type)!="string"
+          or (.body|type)!="string" or (.at|type)!="string"
+          or (({type:"message_sent",id:.id,team:.team,from:.from,
+                to:.to,body:.body,at:.at}|tojson|utf8bytelength) > $max_record)))
+    then error("invalid bounded message envelope")
+    else $rows[]
     end
   ' "$log"
 }
 
 _jsonl_bounded_summary_snapshot() {
-  local team="$1" agent="$2" cursor="$3" log="$4"
-  jq -c --arg team "$team" --arg agent "$agent" --argjson cursor "$cursor" -s '
-    def logical_events: .[] |
-      if .type=="sync_pull_commit" then
-        .messages[]? | select(.status=="imported") | .local_event // empty
-      else . end;
-    [logical_events] as $events |
-    (reduce $events[] as $e ({};
-      if ($e|type)=="object" and $e.type=="message_read"
-         and $e.team==$team and $e.agent==$agent
-      then .[$e.msg_id]=true else . end)) as $read |
-    [$events | to_entries[]
-      | select((.key + 1) > $cursor
-          and (.value|type)=="object"
-          and .value.type=="message_sent"
-          and .value.team==$team and .value.to==$agent
-          and (($read[.value.id] // false) | not))
-      | .value
-      | {id:.id,team:.team,from:.from,to:.to,at:.at,
-         body_type:(.body|type)}] as $rows |
-    if all($rows[];
-      (.id|type)=="string" and (.team|type)=="string"
-      and (.from|type)=="string" and (.to|type)=="string"
-      and .body_type=="string" and (.at|type)=="string")
-    then {type:"unread_summary",unread_count:($rows|length),
-          newest_id:(if ($rows|length)==0 then null else $rows[-1].id end)}
-    else error("invalid bounded message envelope")
-    end
-  ' "$log"
+  local team="$1" agent="$2" cursor="$3" log="$4" max_record="$5"
+  # Project each event to metadata before the aggregate jq slurps it. Bodies
+  # are parsed for type validation but never retained in the summary array.
+  (
+    set -o pipefail
+    jq -c '
+      def logical_events:
+        if (type=="object" and .type=="sync_pull_commit") then
+          .messages[]? | select(type=="object" and .status=="imported") |
+          .local_event // empty
+        else . end;
+      logical_events |
+      if (type=="object" and .type=="message_sent") then
+        {kind:"sent",id:.id,team:.team,from:.from,to:.to,at:.at,
+         body_type:(.body|type)}
+      elif (type=="object" and .type=="message_read") then
+        {kind:"read",team:.team,agent:.agent,msg_id:.msg_id}
+      else empty end
+    ' "$log" |
+    jq -c --arg team "$team" --arg agent "$agent" --argjson cursor "$cursor" \
+      --argjson max_record "$max_record" -s '
+      [ .[] | select(.kind=="sent") ] as $sent |
+      (reduce .[] as $e ({};
+        if $e.kind=="read" and $e.team==$team and $e.agent==$agent
+        then .[($e.msg_id|tostring)]=true else . end)) as $read |
+      ([$sent | to_entries[]
+        | {id:.value.id,team:.value.team,from:.value.from,to:.value.to,
+           at:.value.at,body_type:.value.body_type,delivery_ord:(.key+1)}
+        | select(.delivery_ord > $cursor and .team==$team and .to==$agent
+            and (($read[(.id|tostring)] // false) | not))
+      ] | sort_by([.at,.delivery_ord])) as $rows |
+      ({type:"unread_summary",unread_count:($rows|length),
+        newest_id:(if ($rows|length)==0 then null else $rows[-1].id end)}) as $summary |
+      if (([$rows[] | .id] | unique | length) != ($rows|length)
+          or any($rows[];
+            (.id|type)!="string" or (.team|type)!="string"
+            or (.from|type)!="string" or (.to|type)!="string"
+            or .body_type!="string" or (.at|type)!="string")
+          or (($summary|tojson|utf8bytelength) > $max_record))
+      then error("invalid bounded message envelope")
+      else $summary
+      end
+    '
+  )
 }
 
 _jsonl_bounded_summary_locked() {
-  local team="$1" agent="$2" log cursor
+  local team="$1" agent="$2" log cursor max_record
   log="$(_jsonl_log)" || return 1
   [ -f "$log" ] || return 1
   cursor="$(_jsonl_bounded_cursor_ro "$team" "$agent")" || return 1
-  _jsonl_bounded_summary_snapshot "$team" "$agent" "$cursor" "$log"
+  max_record="${_AGMSG_BOUNDED_MAX_RECORD_BYTES:-8192}"
+  _jsonl_bounded_summary_snapshot "$team" "$agent" "$cursor" "$log" "$max_record"
 }
 
 _jsonl_bounded_rows_locked() {
-  local team="$1" agent="$2" log cursor
+  local team="$1" agent="$2" log cursor max_record
   log="$(_jsonl_log)" || return 1
   [ -f "$log" ] || return 1
   cursor="$(_jsonl_bounded_cursor_ro "$team" "$agent")" || return 1
-  _jsonl_bounded_rows_snapshot "$team" "$agent" "$cursor" "$log"
+  max_record="${_AGMSG_BOUNDED_MAX_RECORD_BYTES:-8192}"
+  _jsonl_bounded_rows_snapshot "$team" "$agent" "$cursor" "$log" "$max_record"
 }
 
 _jsonl_bounded_render_list() {
-  local limit="$1" max_bytes="$2"
-  jq -c -s --argjson limit "$limit" --argjson max_bytes "$max_bytes" '
+  local limit="$1" max_bytes="$2" max_record="$3"
+  jq -c -s --argjson limit "$limit" --argjson max_bytes "$max_bytes" \
+    --argjson max_record "$max_record" '
     map(. + {body_bytes:(.body|utf8bytelength)}) as $rows |
     (reduce range(0; ($rows|length)) as $i
       ({selected:[],selected_body_bytes:0,stop:false,oversize:null};
@@ -338,36 +392,57 @@ _jsonl_bounded_render_list() {
        else .stop=true
        end)) as $decision |
     if $decision.oversize != null then
-      {status:"overflow",out:[($decision.oversize |
-        {type:"bounded_unread_error",reason:"body_too_large",id:.id,
-         body_bytes:.body_bytes,max_body_bytes:$max_bytes,
-         selected_count:0,selected_body_bytes:0,
-         remaining_count:($rows|length),
-         remaining_body_bytes:($rows|map(.body_bytes)|add // 0)})]}
+      ({type:"bounded_unread_error",reason:"body_too_large",id:$decision.oversize.id,
+        body_bytes:$decision.oversize.body_bytes,max_body_bytes:$max_bytes,
+        selected_count:0,selected_body_bytes:0,
+        remaining_count:($rows|length),
+        remaining_body_bytes:($rows|map(.body_bytes)|add // 0)}) as $error |
+      if (($error|tojson|utf8bytelength) > $max_record)
+      then {status:"invalid",out:[]}
+      else {status:"overflow",out:[$error]}
+      end
     else
       ($decision.selected|length) as $selected_count |
       ($decision.selected|map(.body_bytes)|add // 0) as $selected_bytes |
-      {status:"ok",out:(
-        ($decision.selected|map(del(.body_bytes))) +
-        [{type:"bounded_unread_result",selected_count:$selected_count,
-          selected_body_bytes:$selected_bytes,
-          remaining_count:(($rows|length)-$selected_count),
-          remaining_body_bytes:(($rows|map(.body_bytes)|add // 0)-$selected_bytes),
-          limit_items:$limit,max_body_bytes:$max_bytes}])}
+      [{type:"bounded_unread_result",selected_count:$selected_count,
+        selected_body_bytes:$selected_bytes,
+        remaining_count:(($rows|length)-$selected_count),
+        remaining_body_bytes:(($rows|map(.body_bytes)|add // 0)-$selected_bytes),
+        limit_items:$limit,max_body_bytes:$max_bytes}] as $result |
+      if (($result[0]|tojson|utf8bytelength) > $max_record)
+      then {status:"invalid",out:[]}
+      else {status:"ok",out:(
+        ($decision.selected|map(del(.body_bytes,.delivery_ord))) + $result)}
+      end
     end
   '
 }
 
+_jsonl_bounded_emit() {
+  if ! printf '%s\n' "$1"; then
+    printf 'storage: bounded read output write failed\n' >&2
+    return 13
+  fi
+}
+
 storage_unread_summary() {
   _JSONL_TEAM="$1"
-  local team="$1" agent="$2" log cursor output
+  local team="$1" agent="$2" log output
+  _agmsg_bounded_parse_args || return 13
   log="$(_jsonl_log)" || return 13
-  if [ ! -f "$log" ]; then
-    printf '%s\n' '{"type":"unread_summary","unread_count":0,"newest_id":null}'
-    return 0
+  if [ ! -e "$log" ] && [ ! -L "$log" ]; then
+    _jsonl_bounded_emit '{"type":"unread_summary","unread_count":0,"newest_id":null}'
+    return $?
   fi
-  output="$(_jsonl_with_lock _jsonl_bounded_summary_locked "$team" "$agent")" || return 13
-  printf '%s\n' "$output"
+  if [ ! -f "$log" ] || [ ! -r "$log" ]; then
+    printf 'storage: JSONL store is not a readable regular file\n' >&2
+    return 13
+  fi
+  output="$(_jsonl_with_lock _jsonl_bounded_summary_locked "$team" "$agent")" || {
+    printf 'storage: bounded summary read failed\n' >&2
+    return 13
+  }
+  _jsonl_bounded_emit "$output"
 }
 
 storage_list_unread_bounded() {
@@ -376,20 +451,29 @@ storage_list_unread_bounded() {
   shift 2
   _agmsg_bounded_parse_args "$@" || return 13
   log="$(_jsonl_log)" || return 13
-  if [ ! -f "$log" ]; then
-    printf '%s\n' "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"
-    return 0
+  if [ ! -e "$log" ] && [ ! -L "$log" ]; then
+    _jsonl_bounded_emit "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"
+    return $?
   fi
-  snapshot="$(_jsonl_with_lock _jsonl_bounded_rows_locked "$team" "$agent")" || return 13
-  rendered="$(printf '%s\n' "$snapshot" | _jsonl_bounded_render_list "$_AGMSG_BOUNDED_LIMIT" "$_AGMSG_BOUNDED_MAX_BODY_BYTES")" || return 13
+  if [ ! -f "$log" ] || [ ! -r "$log" ]; then
+    printf 'storage: JSONL store is not a readable regular file\n' >&2
+    return 13
+  fi
+  snapshot="$(_jsonl_with_lock _jsonl_bounded_rows_locked "$team" "$agent")" || {
+    printf 'storage: bounded list read failed\n' >&2
+    return 13
+  }
+  rendered="$(printf '%s\n' "$snapshot" | _jsonl_bounded_render_list "$_AGMSG_BOUNDED_LIMIT" "$_AGMSG_BOUNDED_MAX_BODY_BYTES" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")" || return 13
   status="$(printf '%s\n' "$rendered" | jq -r '.status')" || return 13
   case "$status" in
     ok|overflow)
-      printf '%s\n' "$rendered" | jq -c '.out[]' || return 13
+      local public
+      public="$(printf '%s\n' "$rendered" | jq -c '.out[]')" || return 13
+      _jsonl_bounded_emit "$public" || return 13
       [ "$status" = overflow ] && return 13
       return 0
       ;;
-    *) return 13 ;;
+    *) printf 'storage: bounded list validation failed\n' >&2; return 13 ;;
   esac
 }
 
@@ -400,22 +484,45 @@ storage_get_message_bounded() {
   [ -n "$message_id" ] || { printf 'storage: message id is required\n' >&2; return 13; }
   _agmsg_bounded_parse_show_args "$@" || return 13
   log="$(_jsonl_log)" || return 13
-  [ -f "$log" ] || { printf 'storage: message not found\n' >&2; return 13; }
-  snapshot="$(_jsonl_with_lock _jsonl_bounded_rows_locked "$team" "$agent")" || return 13
-  rendered="$(printf '%s\n' "$snapshot" | jq -c -s --arg id "$message_id" --argjson max_bytes "$_AGMSG_BOUNDED_MAX_BODY_BYTES" '
+  if [ ! -e "$log" ] && [ ! -L "$log" ]; then
+    printf 'storage: message not found\n' >&2
+    return 13
+  fi
+  if [ ! -f "$log" ] || [ ! -r "$log" ]; then
+    printf 'storage: JSONL store is not a readable regular file\n' >&2
+    return 13
+  fi
+  snapshot="$(_jsonl_with_lock _jsonl_bounded_rows_locked "$team" "$agent")" || {
+    printf 'storage: bounded show read failed\n' >&2
+    return 13
+  }
+  rendered="$(printf '%s\n' "$snapshot" | jq -c -s --arg id "$message_id" --argjson max_bytes "$_AGMSG_BOUNDED_MAX_BODY_BYTES" --argjson max_record "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" '
     map(select(.id==$id)) as $matches |
     if ($matches|length) != 1 then {status:"invalid",out:[]}
     else ($matches[0] + {body_bytes:($matches[0].body|utf8bytelength)}) as $row |
       if $row.body_bytes > $max_bytes then
-        {status:"overflow",out:[{type:"bounded_message_error",reason:"body_too_large",
-          id:$row.id,body_bytes:$row.body_bytes,max_body_bytes:$max_bytes}]}
-      else {status:"ok",out:[$matches[0]]}
+        ({type:"bounded_message_error",reason:"body_too_large",
+          id:$row.id,body_bytes:$row.body_bytes,max_body_bytes:$max_bytes}) as $error |
+        if (($error|tojson|utf8bytelength) > $max_record)
+        then {status:"invalid",out:[]}
+        else {status:"overflow",out:[$error]}
+        end
+      elif (($matches[0]|tojson|utf8bytelength) > $max_record)
+      then {status:"invalid",out:[]}
+      else {status:"ok",out:[$matches[0] | del(.delivery_ord)]}
       end
     end
   ')" || return 13
   case "$(printf '%s\n' "$rendered" | jq -r '.status')" in
-    ok) printf '%s\n' "$rendered" | jq -c '.out[]' || return 13 ;;
-    overflow) printf '%s\n' "$rendered" | jq -c '.out[]' || return 13; return 13 ;;
+    ok|overflow)
+      local public
+      public="$(printf '%s\n' "$rendered" | jq -c '.out[]')" || return 13
+      _jsonl_bounded_emit "$public" || return 13
+      if [ "$(printf '%s\n' "$rendered" | jq -r '.status')" = overflow ]; then
+        return 13
+      fi
+      return 0
+      ;;
     *) printf 'storage: message not found or malformed\n' >&2; return 13 ;;
   esac
 }

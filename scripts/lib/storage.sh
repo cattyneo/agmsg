@@ -15,6 +15,13 @@
 # full order is env > config > default. Keep that logic here so call sites
 # stay unchanged.
 
+# Bounded read operations cap the encoded size of each public message/metadata
+# record. This is an output-safety bound, not an ID grammar or transport limit:
+# opaque IDs remain byte-for-byte values and later layers still own their ID
+# contract. The cap prevents an untrusted stored ID or envelope from bypassing
+# the otherwise bounded preview/show surface.
+: "${AGMSG_BOUNDED_MAX_RECORD_BYTES:=8192}"
+
 # agmsg_db_path turns the team selector into a path segment, so it cannot do its
 # job without the shared name validator. Sourced here rather than left to each
 # caller: watch.sh already reached the store without validate.sh in scope, and a
@@ -390,6 +397,28 @@ _agmsg_decimal_normalize() {
 _agmsg_bounded_parse_args() {
   _AGMSG_BOUNDED_LIMIT=10
   _AGMSG_BOUNDED_MAX_BODY_BYTES=4096
+  _AGMSG_BOUNDED_MAX_RECORD_BYTES="${AGMSG_BOUNDED_MAX_RECORD_BYTES:-8192}"
+  case "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" in
+    ''|*[!0-9]*)
+      printf 'storage: invalid bounded record-size policy\n' >&2
+      return 13
+      ;;
+  esac
+  # Keep the safety policy itself bounded; this is deliberately separate from
+  # the opaque ID contract and is never exposed as an ID maximum.
+  case "${#_AGMSG_BOUNDED_MAX_RECORD_BYTES}" in
+    1|2|3|4) ;;
+    5)
+      [ "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" -le 65536 ] 2>/dev/null || {
+        printf 'storage: bounded record-size policy is too large\n' >&2
+        return 13
+      }
+      ;;
+    *)
+      printf 'storage: bounded record-size policy is too large\n' >&2
+      return 13
+      ;;
+  esac
   local value normalized
   while [ $# -gt 0 ]; do
     case "$1" in
