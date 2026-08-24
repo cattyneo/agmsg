@@ -98,9 +98,11 @@ storage_import <file>
 storage_compact                # internal; see §2.7
 ```
 
-Every record carries `id` (UUIDv7 for new writes, an opaque string for legacy
-ids) and `at` (ISO-8601 UTC). `storage_send` prints the new message's `id` on a
-single line. The `watch_*` pair is defined in §2.2.
+Every message/event record carries `id` (UUIDv7 for new writes, an opaque
+string for legacy ids) and `at` (ISO-8601 UTC). Metadata, cursor, summary,
+result, and error records carry only the fields defined for their operation.
+`storage_send` prints the new message's `id` on a single line. The `watch_*`
+pair is defined in §2.2.
 
 `storage_store_exists` answers — by exit code, 0 if a store is already present and
 non-trivially initialized, non-zero otherwise — **without creating one**. A read
@@ -127,8 +129,10 @@ from the history record itself.
 a status name (`ok` / `missing_deps` / `runtime_error` / …) on the last stdout
 line, with the matching exit code. The **record-returning ops** —
 `storage_send`, `storage_list_unread`, `storage_read_cursor_get`,
-`storage_history`, `storage_watch_tip`, `storage_watch_after` — write **data
-only** to stdout (JSONL records, or a bare
+`storage_history`, `storage_watch_tip`, `storage_watch_after`,
+`storage_unread_summary`, `storage_list_unread_bounded`, and
+`storage_get_message_bounded` — write **data only** to stdout (JSONL records,
+or a bare
 id / cursor token; one record per line) and signal outcome with the **exit code**
 alone: `0` on success, non-zero with a message on **stderr** on failure. They
 never emit a §1.4 status name to stdout, so a status word can never be misread as
@@ -138,6 +142,76 @@ data stream (a designated final line), not a status.
 `storage_describe` is a **metadata op**, not a control op: it always exits 0 and
 writes only its `key=value` registry metadata to stdout — never a §1.4 status
 name, which a metadata consumer would otherwise misread.
+
+#### 2.1.1 Bounded read-only operations (fork order 2b phase 1)
+
+The bundled drivers additionally expose the following lower-level read surface:
+
+```
+storage_unread_summary <team> <agent>
+storage_list_unread_bounded <team> <agent> [--limit-items N] [--max-body-bytes N]
+storage_get_message_bounded <team> <agent> <opaque-id> [--max-body-bytes N]
+```
+
+These operations are read-only observations. A missing store returns an empty
+summary or bounded-list result without creating a file, schema, migration
+marker, cursor, lock, event, receipt, claim, key, or other durable state. A
+present but unreadable store fails non-zero; it is never treated as empty. Each
+operation reads one consistent snapshot and validates the complete candidate
+set before emitting any public stdout.
+
+`storage_unread_summary` emits one JSON record:
+
+```json
+{"type":"unread_summary","unread_count":2,"newest_id":"..."}
+```
+
+`newest_id` is `null` for an empty set. Bodies are not part of this record.
+
+`storage_list_unread_bounded` emits a consecutive prefix of unread
+`message_sent` records in delivery order, followed by:
+
+```json
+{"type":"bounded_unread_result","selected_count":1,"selected_body_bytes":4,"remaining_count":2,"remaining_body_bytes":9,"limit_items":10,"max_body_bytes":4096}
+```
+
+The defaults are `limit_items=10` and `max_body_bytes=4096`; accepted values
+are `0..10` and `0..4096`. Body limits count raw UTF-8 bytes and a body is
+always emitted whole or not at all. If the first candidate body exceeds the
+bound, the operation emits only bounded metadata (without `body`) with
+`type=bounded_unread_error` and `reason=body_too_large`, then exits non-zero.
+A later candidate that does not fit remains in the reported remaining count and
+byte total. Invalid bounds, malformed envelopes, ambiguous rows, and driver
+failures emit no public stdout and exit non-zero.
+
+Every completed JSON record produced by these three operations is also subject
+to the output-safety policy `AGMSG_BOUNDED_MAX_RECORD_BYTES`. Its default is
+8,192 raw UTF-8 bytes and a configured decimal value must not exceed 65,536.
+The byte count covers the compact JSON record and excludes its trailing
+newline. Before any public write, the driver validates every record that the
+operation may emit; list/show therefore validate their candidate message
+records as well as result/error records. If any completed record would exceed
+the policy, the whole operation exits non-zero with zero stdout, no durable
+state change, and a bounded diagnostic on stderr.
+
+This is a bound on a bounded-operation output record, not an ID transport
+grammar or an ID-specific maximum. An opaque ID contributes to the encoded
+record size and may therefore make that bounded record unavailable, while the
+stored ID and the existing unbounded storage ABI remain unchanged. Until the
+downstream ID transport contract is decided, `.agents` must not call this
+bounded surface, pin the fork for it, or activate it at runtime.
+
+`storage_get_message_bounded` returns one unread `message_sent` row addressed
+to the supplied agent and matching the opaque stored ID, when its complete body
+fits the requested bound. It is recipient-scoped and does not mark the row read
+or advance a cursor; inspecting a later row is never an acknowledgement
+candidate. An oversized match emits only `bounded_message_error` metadata and
+exits non-zero. IDs remain byte-for-byte opaque strings here: this operation
+does not define transport encoding, shell quoting, or a new ID maximum.
+
+Public CLI framing, receipt issuance/crypto/expiry/replay/nonce, ack atomicity,
+JSONL crash recovery or old-reader migration, and precedence with `#373` remain
+separate decisions and are not part of these driver functions.
 
 ### 2.2 Delivery cursor (watch / replay)
 

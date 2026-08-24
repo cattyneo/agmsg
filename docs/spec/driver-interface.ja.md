@@ -86,7 +86,35 @@ storage_export <file>
 storage_import <file>
 ```
 
-すべての関数は、レコードを返す際にstdoutへ構造化された出力（JSONL）を書き込み、ステータスについては§1.4に従う。レコードには常に `id`（新規書き込みではUUIDv7、レガシーIDでは不透明な文字列）と `at`（ISO-8601 UTC）が含まれる。
+すべての関数は、レコードを返す際にstdoutへ構造化された出力（JSONL）を書き込み、ステータスについては§1.4に従う。message/event recordには常に `id`（新規書き込みではUUIDv7、レガシーIDでは不透明な文字列）と `at`（ISO-8601 UTC）が含まれる。metadata、cursor、summary、result、error recordは各操作で定義したfieldだけを持つ。
+
+#### 2.1.1 bounded read-only操作（fork order 2b phase 1）
+
+バンドル済みドライバーは、後続のCLI・receipt・ackが利用する下位の読み取り面として、次の関数も提供する：
+
+```
+storage_unread_summary <team> <agent>
+storage_list_unread_bounded <team> <agent> [--limit-items N] [--max-body-bytes N]
+storage_get_message_bounded <team> <agent> <opaque-id> [--max-body-bytes N]
+```
+
+これらは読み取り専用の観測である。存在しないstoreはファイル、schema、移行marker、cursor、lock、event、receipt、claim、keyその他の永続状態を作らず、空のsummaryまたはbounded listを返す。存在するが読めないstoreは空として扱わず、non-zeroで失敗する。各操作は1つの一貫したsnapshotを読み、公開stdoutへ出す前に候補全体を検証する。
+
+`storage_unread_summary` は次の1 JSON recordを返す。空集合では `newest_id` が `null` になる。bodyは含めない。
+
+```json
+{"type":"unread_summary","unread_count":2,"newest_id":"..."}
+```
+
+`storage_list_unread_bounded` はdelivery順のunread `message_sent` の連続prefixを返し、最後に選択分と残りの件数・body byte数を示すrecordを返す。既定値は `limit_items=10`、`max_body_bytes=4096` で、指定値はそれぞれ `0..10`、`0..4096` である。body byte数はraw UTF-8 byte数で数え、bodyを途中で切らない。先頭候補が上限を超える場合はbodyを含まない `type=bounded_unread_error` / `reason=body_too_large` のbounded metadataだけを出してnon-zeroで終了する。後続候補が収まらない場合はremainingの件数・byte数に残す。範囲外の引数、malformed envelope、曖昧な候補、driver failureでは公開stdoutを出さずnon-zeroで終了する。
+
+この3操作が生成する完成済みJSON recordには、出力安全ポリシー `AGMSG_BOUNDED_MAX_RECORD_BYTES` も適用する。既定値はraw UTF-8で8,192 bytes、設定する10進値の最大は65,536である。byte数はcompact JSON recordを数え、末尾newlineは含めない。driverは公開出力前に、その操作が出力し得る全recordを検証するため、list/showでは候補message recordに加えてresult/error recordも対象になる。完成recordが1件でもポリシーを超える場合、操作全体をnon-zero、stdout 0 bytes、永続状態変更なし、bounded stderr diagnosticで失敗させる。
+
+これはbounded操作が出力する1 recordの上限であり、ID transport grammarやID固有の最大長ではない。opaque IDもencoded record byte数には含まれるため、そのIDを含むbounded recordが利用不能になることはあるが、保存済みIDと既存のunbounded storage ABIは変更しない。downstreamのID transport契約が決まるまで、`.agents`はこのbounded surfaceを呼び出さず、そのためのfork pinやruntime activationも行わない。
+
+`storage_get_message_bounded` は指定agent宛てで、opaqueな保存済みIDに一致するunread `message_sent` を、body全体が上限内の場合だけ1件返す。recipient scopeを越えず、read markerやcursorを変更しない。後続行を調べてもack候補にはならない。bodyが大きすぎる場合はbodyを含まない `bounded_message_error` metadataだけを出してnon-zeroで終了する。ここでIDはbyte-for-byteのopaque stringであり、transport encoding、shell quoting、新しいID上限は定義しない。
+
+公開CLIのframing、receiptの発行・暗号・expiry・replay・nonce、ackのatomicity、JSONL crash recovery・旧reader移行、`#373`とのprecedenceは別決定であり、このdriver関数には含めない。
 
 ### 2.2 イベントログスキーマ
 

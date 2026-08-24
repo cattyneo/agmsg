@@ -384,6 +384,339 @@ storage_list_unread() {
   "
 }
 
+# --- bounded read-only facade (#203 fork phase 1) --------------------------
+# These helpers deliberately do not call storage_init: a read of a storeless
+# project must not create a database, cursor, or migration marker. The SQL
+# snapshot also carries a private first-line status marker. Callers capture the
+# complete result before emitting any public JSON, so a malformed candidate can
+# never produce a partial stdout stream.
+
+_sqlite_bounded_unread_cte() {
+  local team="$1" agent="$2" tl al
+  tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
+  cat <<SQL
+WITH unread AS (
+  SELECT e.id AS id, e.team AS team, e.from_agent AS from_agent,
+         e.to_agent AS to_agent, e.body AS body, e.at AS at,
+         e.at AS ts, 1 AS src, e.seq AS ord
+    FROM events e
+   WHERE e.type='message_sent' AND e.team='$tl' AND e.to_agent='$al'
+     AND e.seq>COALESCE((SELECT local_position FROM read_cursors
+                           WHERE team='$tl' AND agent='$al'),0)
+     AND NOT EXISTS (SELECT 1 FROM events r
+                       WHERE r.type='message_read' AND r.team=e.team
+                         AND r.agent='$al' AND r.msg_id=e.id)
+  UNION ALL
+  SELECT CAST(m.id AS TEXT) AS id, m.team AS team, m.from_agent AS from_agent,
+         m.to_agent AS to_agent, m.body AS body, m.created_at AS at,
+         m.created_at AS ts, 0 AS src, m.id AS ord
+    FROM messages m
+   WHERE m.team='$tl' AND m.to_agent='$al' AND m.read_at IS NULL
+     AND NOT EXISTS (SELECT 1 FROM events r
+                       WHERE r.type='message_read' AND r.team=m.team
+                         AND r.agent='$al' AND r.msg_id=CAST(m.id AS TEXT))
+     AND NOT EXISTS (SELECT 1 FROM events e2
+                       WHERE e2.legacy_id=m.id AND e2.seq>0)
+)
+SQL
+}
+
+_sqlite_bounded_list_sql() {
+  local team="$1" agent="$2" limit="$3" max_bytes="$4" max_record="$5" cte
+  cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  cat <<SQL
+$cte,
+ordered AS (
+  SELECT u.*,
+         length(CAST(u.body AS BLOB)) AS body_bytes,
+         row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n,
+         sum(length(CAST(u.body AS BLOB))) OVER
+           (ORDER BY u.ts,u.src,u.ord ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           AS cumulative_bytes,
+         length(CAST(json_object('type','message_sent','id',u.id,'team',u.team,
+           'from',u.from_agent,'to',u.to_agent,'body',u.body,'at',u.at) AS BLOB))
+           AS record_bytes
+    FROM unread u
+),
+checks AS (
+  SELECT COUNT(*) AS total_count,
+         COALESCE(SUM(body_bytes),0) AS total_body_bytes,
+         COALESCE(SUM(CASE WHEN typeof(id)!='text'
+                              OR typeof(team)!='text'
+                              OR typeof(from_agent)!='text'
+                              OR typeof(to_agent)!='text'
+                              OR typeof(body)!='text'
+                              OR typeof(at)!='text' THEN 1 ELSE 0 END),0) AS bad_count,
+         COUNT(*)-COUNT(DISTINCT id) AS duplicate_count,
+         COALESCE(SUM(CASE WHEN record_bytes>$max_record THEN 1 ELSE 0 END),0)
+           AS oversize_count,
+         COALESCE(MAX(CASE WHEN n=1 THEN body_bytes END),0) AS first_body_bytes
+    FROM ordered
+),
+state AS (
+  SELECT CASE
+           WHEN bad_count>0 OR duplicate_count>0 OR oversize_count>0 THEN 'invalid'
+           WHEN $limit>0 AND total_count>0 AND first_body_bytes>$max_bytes
+             THEN 'overflow_first'
+           ELSE 'ok'
+         END AS status,
+         total_count,total_body_bytes,first_body_bytes
+    FROM checks
+)
+SELECT line FROM (
+  SELECT 0 AS phase, 0 AS ord,
+         json_object('type','__agmsg_bounded_status','status',status) AS line
+    FROM state
+  UNION ALL
+  SELECT 1, 0,
+         json_object('type','bounded_unread_error','reason','body_too_large',
+           'id',(SELECT id FROM ordered WHERE n=1),
+           'body_bytes',first_body_bytes,'max_body_bytes',$max_bytes,
+           'selected_count',0,'selected_body_bytes',0,
+           'remaining_count',total_count,'remaining_body_bytes',total_body_bytes)
+    FROM state
+   WHERE status='overflow_first'
+  UNION ALL
+  SELECT 1, n,
+         json_object('type','message_sent','id',id,'team',team,
+           'from',from_agent,'to',to_agent,'body',body,'at',at)
+    FROM ordered,state
+   WHERE state.status='ok' AND n<=$limit AND cumulative_bytes<=$max_bytes
+  UNION ALL
+  SELECT 2, 0,
+         json_object('type','bounded_unread_result',
+           'selected_count',COALESCE(SUM(CASE WHEN n<=$limit
+                                                AND cumulative_bytes<=$max_bytes
+                                               THEN 1 ELSE 0 END),0),
+           'selected_body_bytes',COALESCE(SUM(CASE WHEN n<=$limit
+                                                   AND cumulative_bytes<=$max_bytes
+                                                  THEN body_bytes ELSE 0 END),0),
+           'remaining_count',total_count-COALESCE(SUM(CASE WHEN n<=$limit
+                                                            AND cumulative_bytes<=$max_bytes
+                                                           THEN 1 ELSE 0 END),0),
+           'remaining_body_bytes',total_body_bytes-COALESCE(SUM(CASE WHEN n<=$limit
+                                                                       AND cumulative_bytes<=$max_bytes
+                                                                      THEN body_bytes ELSE 0 END),0),
+           'limit_items',$limit,'max_body_bytes',$max_bytes)
+    FROM state
+    LEFT JOIN ordered ON 1=1
+   WHERE state.status='ok'
+   GROUP BY total_count,total_body_bytes
+)
+ORDER BY phase,ord;
+SQL
+}
+
+_sqlite_bounded_summary_sql() {
+  local team="$1" agent="$2" max_record="$3" tl al
+  tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$agent")"
+  cat <<SQL
+WITH unread AS (
+  SELECT e.id AS id, e.team AS team, e.from_agent AS from_agent,
+         e.to_agent AS to_agent, typeof(e.body) AS body_type, e.at AS at,
+         e.at AS ts, 1 AS src, e.seq AS ord
+    FROM events e
+   WHERE e.type='message_sent' AND e.team='$tl' AND e.to_agent='$al'
+     AND e.seq>COALESCE((SELECT local_position FROM read_cursors
+                           WHERE team='$tl' AND agent='$al'),0)
+     AND NOT EXISTS (SELECT 1 FROM events r
+                       WHERE r.type='message_read' AND r.team=e.team
+                         AND r.agent='$al' AND r.msg_id=e.id)
+  UNION ALL
+  SELECT CAST(m.id AS TEXT), m.team, m.from_agent, m.to_agent,
+         typeof(m.body), m.created_at, m.created_at, 0, m.id
+    FROM messages m
+   WHERE m.team='$tl' AND m.to_agent='$al' AND m.read_at IS NULL
+     AND NOT EXISTS (SELECT 1 FROM events r WHERE r.type='message_read'
+                       AND r.team=m.team AND r.agent='$al'
+                       AND r.msg_id=CAST(m.id AS TEXT))
+     AND NOT EXISTS (SELECT 1 FROM events e2
+                       WHERE e2.legacy_id=m.id AND e2.seq>0)
+),
+ordered AS (
+  SELECT u.*, row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n
+    FROM unread u
+),
+summary AS (
+  SELECT (SELECT COUNT(*) FROM unread) AS unread_count,
+         (SELECT id FROM ordered ORDER BY ts DESC,src DESC,ord DESC LIMIT 1)
+           AS newest_id
+),
+checks AS (
+  SELECT COALESCE((SELECT SUM(CASE WHEN id IS NULL OR typeof(id)!='text'
+                              OR typeof(team)!='text'
+                              OR typeof(from_agent)!='text'
+                              OR typeof(to_agent)!='text'
+                              OR body_type IS NULL OR body_type!='text'
+                              OR typeof(at)!='text'
+                         THEN 1 ELSE 0 END) FROM unread),0) AS bad_count,
+         (SELECT COUNT(*) FROM unread)-
+         (SELECT COUNT(DISTINCT id) FROM unread) AS duplicate_count,
+         length(CAST(json_object('type','unread_summary',
+           'unread_count',summary.unread_count,'newest_id',summary.newest_id)
+           AS BLOB)) AS summary_bytes
+    FROM summary
+)
+SELECT line FROM (
+  SELECT 0 AS phase, json_object('type','__agmsg_bounded_status',
+                                 'status',CASE WHEN checks.bad_count>0
+                                      OR checks.duplicate_count>0
+                                      OR checks.summary_bytes>$max_record
+                                      THEN 'invalid' ELSE 'ok' END) AS line
+    FROM checks
+  UNION ALL
+  SELECT 1, json_object('type','unread_summary',
+         'unread_count',summary.unread_count,'newest_id',summary.newest_id)
+    FROM checks CROSS JOIN summary
+   WHERE checks.bad_count=0 AND checks.duplicate_count=0
+     AND checks.summary_bytes<=$max_record
+)
+ORDER BY phase;
+SQL
+}
+
+_sqlite_bounded_show_sql() {
+  local team="$1" agent="$2" message_id="$3" max_bytes="$4" max_record="$5"
+  local cte tlid; cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  tlid="$(_sqlite_lit "$message_id")"
+  cat <<SQL
+$cte,
+target AS (
+  SELECT * FROM unread WHERE id='$tlid'
+),
+checks AS (
+  SELECT COUNT(*) AS target_count,
+         COALESCE(SUM(CASE WHEN typeof(id)!='text'
+                              OR typeof(team)!='text'
+                              OR typeof(from_agent)!='text'
+                              OR typeof(to_agent)!='text'
+                              OR typeof(body)!='text'
+                              OR typeof(at)!='text' THEN 1 ELSE 0 END),0) AS bad_count,
+         COALESCE(MAX(length(CAST(body AS BLOB))),0) AS body_bytes
+         ,COALESCE(MAX(length(CAST(json_object('type','message_sent','id',id,
+             'team',team,'from',from_agent,'to',to_agent,'body',body,'at',at)
+             AS BLOB))),0) AS record_bytes,
+         COALESCE(MAX(length(CAST(json_object('type','bounded_message_error',
+             'reason','body_too_large','id',id,'body_bytes',length(CAST(body AS BLOB)),
+             'max_body_bytes',$max_bytes) AS BLOB))),0) AS overflow_bytes
+    FROM target
+),
+state AS (
+  SELECT CASE
+           WHEN bad_count>0 THEN 'invalid'
+           WHEN target_count=0 THEN 'not_found'
+           WHEN target_count>1 THEN 'ambiguous'
+           WHEN body_bytes>$max_bytes AND overflow_bytes>$max_record THEN 'invalid'
+           WHEN body_bytes<=$max_bytes AND record_bytes>$max_record THEN 'invalid'
+           WHEN body_bytes>$max_bytes THEN 'overflow'
+           ELSE 'ok'
+         END AS status, target_count,body_bytes
+    FROM checks
+)
+SELECT line FROM (
+  SELECT 0 AS phase, 0 AS ord,
+         json_object('type','__agmsg_bounded_status','status',status) AS line
+    FROM state
+  UNION ALL
+  SELECT 1, 0,
+         json_object('type','bounded_message_error','reason','body_too_large',
+           'id',(SELECT id FROM target LIMIT 1),'body_bytes',body_bytes,
+           'max_body_bytes',$max_bytes)
+    FROM state WHERE status='overflow'
+  UNION ALL
+  SELECT 1, 0,
+         json_object('type','message_sent','id',id,'team',team,
+           'from',from_agent,'to',to_agent,'body',body,'at',at)
+    FROM target,state WHERE state.status='ok'
+)
+ORDER BY phase,ord;
+SQL
+}
+
+_sqlite_bounded_public_result() {
+  local output="$1" expected="$2" on_overflow="${3:-0}" first rest
+  first="$(printf '%s\n' "$output" | sed -n '1p')"
+  case "$first" in
+    "{\"type\":\"__agmsg_bounded_status\",\"status\":\"$expected\"}")
+      rest="$(printf '%s\n' "$output" | tail -n +2)"
+      [ -n "$rest" ] || { printf 'storage: bounded read returned no record\n' >&2; return 13; }
+      _agmsg_bounded_emit_records "$rest" || return 13
+      [ "$on_overflow" -eq 1 ] && return 13
+      return 0
+      ;;
+    *) printf 'storage: bounded read validation failed\n' >&2; return 13 ;;
+  esac
+}
+
+storage_unread_summary() {
+  local team="$1" agent="$2" db output
+  _agmsg_bounded_parse_args || return 13
+  db="$(_sqlite_db "$team")" || return 13
+  if [ ! -e "$db" ] && [ ! -L "$db" ]; then
+    _agmsg_bounded_emit_records '{"type":"unread_summary","unread_count":0,"newest_id":null}'
+    return $?
+  fi
+  if [ ! -f "$db" ] || [ ! -r "$db" ]; then
+    printf 'storage: SQLite store is not a readable regular file\n' >&2
+    return 13
+  fi
+  output="$(_sqlite_data "$team" "$(_sqlite_bounded_summary_sql "$team" "$agent" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")")" || return 13
+  _sqlite_bounded_public_result "$output" ok
+}
+
+storage_list_unread_bounded() {
+  local team="$1" agent="$2" db output
+  shift 2
+  _agmsg_bounded_parse_args "$@" || return 13
+  db="$(_sqlite_db "$team")" || return 13
+  if [ ! -e "$db" ] && [ ! -L "$db" ]; then
+    _agmsg_bounded_emit_records "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"
+    return $?
+  fi
+  if [ ! -f "$db" ] || [ ! -r "$db" ]; then
+    printf 'storage: SQLite store is not a readable regular file\n' >&2
+    return 13
+  fi
+  output="$(_sqlite_data "$team" "$(_sqlite_bounded_list_sql "$team" "$agent" "$_AGMSG_BOUNDED_LIMIT" "$_AGMSG_BOUNDED_MAX_BODY_BYTES" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")")" || return 13
+  if [ "$(printf '%s\n' "$output" | sed -n '1p')" = '{"type":"__agmsg_bounded_status","status":"overflow_first"}' ]; then
+    _sqlite_bounded_public_result "$output" overflow_first 1
+    return $?
+  fi
+  _sqlite_bounded_public_result "$output" ok
+}
+
+storage_get_message_bounded() {
+  local team="$1" agent="$2" message_id="$3" db output first rest
+  shift 3
+  [ -n "$message_id" ] || { printf 'storage: message id is required\n' >&2; return 13; }
+  _agmsg_bounded_parse_show_args "$@" || return 13
+  db="$(_sqlite_db "$team")" || return 13
+  if [ ! -e "$db" ] && [ ! -L "$db" ]; then
+    printf 'storage: message not found\n' >&2
+    return 13
+  fi
+  if [ ! -f "$db" ] || [ ! -r "$db" ]; then
+    printf 'storage: SQLite store is not a readable regular file\n' >&2
+    return 13
+  fi
+  output="$(_sqlite_data "$team" "$(_sqlite_bounded_show_sql "$team" "$agent" "$message_id" "$_AGMSG_BOUNDED_MAX_BODY_BYTES" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")")" || return 13
+  first="$(printf '%s\n' "$output" | sed -n '1p')"
+  case "$first" in
+    '{"type":"__agmsg_bounded_status","status":"ok"}')
+      rest="$(printf '%s\n' "$output" | tail -n +2)"
+      [ -n "$rest" ] || { printf 'storage: bounded show returned no record\n' >&2; return 13; }
+      _agmsg_bounded_emit_records "$rest" || return 13
+      ;;
+    '{"type":"__agmsg_bounded_status","status":"overflow"}')
+      rest="$(printf '%s\n' "$output" | tail -n +2)"
+      [ -n "$rest" ] || { printf 'storage: bounded show overflow missing metadata\n' >&2; return 13; }
+      _agmsg_bounded_emit_records "$rest" || return 13
+      return 13
+      ;;
+    *) printf 'storage: message not found or malformed\n' >&2; return 13 ;;
+  esac
+}
+
 # storage_mark_read_batch <team> <agent> <id> [<id> ...]  (control op)
 storage_mark_read_batch() {
   local team="$1" agent="$2"; shift 2

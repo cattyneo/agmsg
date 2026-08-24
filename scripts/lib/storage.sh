@@ -15,6 +15,13 @@
 # full order is env > config > default. Keep that logic here so call sites
 # stay unchanged.
 
+# Bounded read operations cap the encoded size of each public message/metadata
+# record. This is an output-safety bound, not an ID grammar or transport limit:
+# opaque IDs remain byte-for-byte values and later layers still own their ID
+# contract. The cap prevents an untrusted stored ID or envelope from bypassing
+# the otherwise bounded preview/show surface.
+: "${AGMSG_BOUNDED_MAX_RECORD_BYTES:=8192}"
+
 # agmsg_db_path turns the team selector into a path segment, so it cannot do its
 # job without the shared name validator. Sourced here rather than left to each
 # caller: watch.sh already reached the store without validate.sh in scope, and a
@@ -372,6 +379,130 @@ fi
 # break the INSERT/UPDATE and is an injection surface (#223, #87).
 agmsg_sqlesc() {
   printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# Parse the bounded read options shared by the bundled drivers. The bounds are
+# intentionally finite at this lower layer: a later public CLI may choose a
+# smaller policy, but it must not turn a preview into an unbounded body read.
+# Keep this Bash 3.2-compatible and independent of jq so the sqlite driver does
+# not acquire the JSONL driver's optional dependency.
+_agmsg_decimal_normalize() {
+  local value="$1"
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  while [ "${value#0}" != "$value" ]; do value="${value#0}"; done
+  [ -n "$value" ] || value=0
+  printf '%s\n' "$value"
+}
+
+_agmsg_bounded_parse_args() {
+  _AGMSG_BOUNDED_LIMIT=10
+  _AGMSG_BOUNDED_MAX_BODY_BYTES=4096
+  _AGMSG_BOUNDED_MAX_RECORD_BYTES="${AGMSG_BOUNDED_MAX_RECORD_BYTES:-8192}"
+  case "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" in
+    ''|*[!0-9]*)
+      printf 'storage: invalid bounded record-size policy\n' >&2
+      return 13
+      ;;
+  esac
+  # Keep the safety policy itself bounded; this is deliberately separate from
+  # the opaque ID contract and is never exposed as an ID maximum.
+  case "${#_AGMSG_BOUNDED_MAX_RECORD_BYTES}" in
+    1|2|3|4) ;;
+    5)
+      [ "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" -le 65536 ] 2>/dev/null || {
+        printf 'storage: bounded record-size policy is too large\n' >&2
+        return 13
+      }
+      ;;
+    *)
+      printf 'storage: bounded record-size policy is too large\n' >&2
+      return 13
+      ;;
+  esac
+  local value normalized
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit-items)
+        [ $# -ge 2 ] || { printf 'storage: --limit-items requires a value\n' >&2; return 13; }
+        value="$2"; shift 2
+        normalized="$(_agmsg_decimal_normalize "$value")" || {
+          printf 'storage: invalid --limit-items\n' >&2; return 13;
+        }
+        case "$normalized" in
+          0|1|2|3|4|5|6|7|8|9|10) _AGMSG_BOUNDED_LIMIT="$normalized" ;;
+          *) printf 'storage: --limit-items must be between 0 and 10\n' >&2; return 13 ;;
+        esac
+        ;;
+      --max-body-bytes)
+        [ $# -ge 2 ] || { printf 'storage: --max-body-bytes requires a value\n' >&2; return 13; }
+        value="$2"; shift 2
+        normalized="$(_agmsg_decimal_normalize "$value")" || {
+          printf 'storage: invalid --max-body-bytes\n' >&2; return 13;
+        }
+        # Strip leading zeroes before the length/numeric check, so a large
+        # textual token cannot overflow shell arithmetic.
+        case "${#normalized}" in
+          1|2|3) _AGMSG_BOUNDED_MAX_BODY_BYTES="$normalized" ;;
+          4)
+            [ "$normalized" -le 4096 ] 2>/dev/null || {
+              printf 'storage: --max-body-bytes must be between 0 and 4096\n' >&2; return 13;
+            }
+            _AGMSG_BOUNDED_MAX_BODY_BYTES="$normalized"
+            ;;
+          *) printf 'storage: --max-body-bytes must be between 0 and 4096\n' >&2; return 13 ;;
+        esac
+        ;;
+      *)
+        printf 'storage: unknown bounded read option\n' >&2
+        return 13
+        ;;
+    esac
+  done
+}
+
+# Validate every completed public JSON record before a single final write.
+# Records are compact JSONL, so a literal newline is the record separator and
+# is not part of the per-record UTF-8 byte limit.
+_agmsg_bounded_emit_records() {
+  local records="$1" rest record bytes last=0
+  [ -n "$records" ] || {
+    printf 'storage: bounded read returned no record\n' >&2
+    return 13
+  }
+  rest="$records"
+  while :; do
+    case "$rest" in
+      *$'\n'*)
+        record="${rest%%$'\n'*}"
+        rest="${rest#*$'\n'}"
+        ;;
+      *)
+        record="$rest"
+        last=1
+        ;;
+    esac
+    bytes="$(LC_ALL=C printf '%s' "$record" | wc -c | tr -d '[:space:]')" || return 13
+    [ "$bytes" -le "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" ] 2>/dev/null || {
+      printf 'storage: bounded record exceeds output policy\n' >&2
+      return 13
+    }
+    [ "$last" -eq 0 ] || break
+  done
+  if ! printf '%s\n' "$records"; then
+    printf 'storage: bounded read output write failed\n' >&2
+    return 13
+  fi
+}
+
+_agmsg_bounded_parse_show_args() {
+  local option
+  for option in "$@"; do
+    [ "$option" != "--limit-items" ] || {
+      printf 'storage: --limit-items is not valid for exact show\n' >&2
+      return 13
+    }
+  done
+  _agmsg_bounded_parse_args "$@"
 }
 
 # ── Storage driver facade (storage axis) ─────────────────────────────────────
