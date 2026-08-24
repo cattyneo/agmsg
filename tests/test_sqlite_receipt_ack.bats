@@ -196,7 +196,7 @@ assert_zero_stdout_failure() {
   agmsg_receipt_resolve_runtime
   local rows="$BATS_TEST_TMPDIR/vector.rows" frame="$BATS_TEST_TMPDIR/frame"
   local payload="$BATS_TEST_TMPDIR/payload" batch_rows="$BATS_TEST_TMPDIR/batch.rows"
-  local batch="$BATS_TEST_TMPDIR/batch" expected="$BATS_TEST_TMPDIR/batch.expected"
+  local batch="$BATS_TEST_TMPDIR/batch" expected="$BATS_TEST_TMPDIR/batch.expected" vector
   printf '0|7465616d2d61|616c696365|626f62|323032362d30312d30325430333a30343a30355a|event|42|61|78\n' >"$rows"
   _agmsg_receipt_canonicalize frame "$rows" "$frame"
   [ "$(xxd -p -c 1000000 "$frame" | tr -d '\n')" = "$(fixture_field frame-payload-base material_hex)" ]
@@ -207,6 +207,15 @@ assert_zero_stdout_failure() {
     "$(fixture_field batch-base sha256)" "$(fixture_field frame-payload-base sha256)" \
     42 1700000000 1700000900 00112233445566778899aabbccddeeff
   [ "$(xxd -p -c 1000000 "$payload" | tr -d '\n')" = "$(fixture_field payload-base material_hex)" ]
+
+  for vector in batch-base batch-id-boundary batch-id-changed batch-body-changed; do
+    printf '0|74|61|72|323032362d30312d30325430333a30343a30355a|event|7|%s|%s\n' \
+      "$(fixture_field "$vector" input_id_hex)" \
+      "$(fixture_field "$vector" input_body_hex)" >"$batch_rows"
+    _agmsg_receipt_canonicalize batch "$batch_rows" "$batch"
+    [ "$(xxd -p -c 1000000 "$batch" | tr -d '\n')" = "$(fixture_field "$vector" material_hex)" ]
+    [ "$(shasum -a 256 "$batch" | awk '{print $1}')" = "$(fixture_field "$vector" sha256)" ]
+  done
 
   printf '0|74|61|72|323032362d30312d30325430333a30343a30355a|event|7|696431|6162636465666768\n1|74|61|72|323032362d30312d30325430333a30343a30365a|event|8|696432|78\n' >"$batch_rows"
   _agmsg_receipt_canonicalize batch "$batch_rows" "$batch"
@@ -310,6 +319,29 @@ SH
   [ "$(durable_state)" = "$before" ]
 }
 
+@test "a base64 encoder that prints a valid-looking prefix then fails cannot issue a receipt" {
+  sql_event base64-failure alice bob body 2026-01-01T00:00:00Z
+  local before wrapper="$BATS_TEST_TMPDIR/openssl-base64-partial" secret='base64-secret-stderr-91bc4e72'
+  before="$(durable_state)"
+  cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = base64 ]; then
+  printf '%s' YWJj
+  printf '%s\n' "$BASE64_FAILURE_SECRET" >&2
+  exit 71
+fi
+exec "$REAL_RECEIPT_OPENSSL" "$@"
+SH
+  chmod 755 "$wrapper"
+  export REAL_RECEIPT_OPENSSL="$(command -v openssl)"
+  export BASE64_FAILURE_SECRET="$secret"
+  export AGMSG_RECEIPT_OPENSSL="$wrapper"
+  assert_zero_stdout_failure base64-partial storage_list_unread_bounded receipts bob \
+    --limit-items 1 --max-body-bytes 4096 --issue-receipt
+  refute grep -Fq -- "$secret" "$BATS_TEST_TMPDIR/base64-partial.stderr"
+  [ "$(durable_state)" = "$before" ]
+}
+
 @test "duplicate and malformed snapshot rows fail before stdout" {
   sql_event duplicate alice bob first 2026-01-01T00:00:00Z
   run storage_list_unread_bounded receipts bob --limit-items 1 --max-body-bytes 4096 --issue-receipt
@@ -339,6 +371,34 @@ SH
   [ "$frontier" = "$old_frontier" ]
   sql_event appended alice bob appended 2026-01-01T00:00:04Z
   [ "$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^issuance_frontier=//p')" = "$old_frontier" ]
+}
+
+@test "same-timestamp legacy and event rows bind source-kind and ordinal total order into the frame digest" {
+  local db at=2026-01-01T00:00:00Z output token actual expected_file
+  db="$(agmsg_db_path receipts)"
+  sqlite3 "$db" "
+    INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
+      VALUES(101,'receipts','legacy-a','bob','legacy-body-a','$at');
+    INSERT INTO messages(id,team,from_agent,to_agent,body,created_at)
+      VALUES(102,'receipts','legacy-b','bob','legacy-body-b','$at');
+    INSERT INTO events(type,id,team,from_agent,to_agent,body,at)
+      VALUES('message_sent','event-a','receipts','event-a-sender','bob','event-body-a','$at');
+    INSERT INTO events(type,id,team,from_agent,to_agent,body,at)
+      VALUES('message_sent','event-b','receipts','event-b-sender','bob','event-body-b','$at');" >/dev/null
+  output="$(storage_list_unread_bounded receipts bob --limit-items 10 --max-body-bytes 4096 --issue-receipt)"
+  [ "$(printf '%s\n' "$output" | jq -r 'select(.type=="message_sent") | .id' | paste -sd, -)" = 101,102,event-a,event-b ]
+  token="$(receipt_token "$output")"
+  decode_receipt "$token"
+  actual="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^frame_sha256=//p')"
+  expected_file="$BATS_TEST_TMPDIR/expected-source-order.frame"
+  {
+    printf 'agmsg-frame-v1\n'
+    printf 'index=0\nteam_len=8\nteam_hex=7265636569707473\nfrom_len=8\nfrom_hex=6c65676163792d61\nto_len=3\nto_hex=626f62\nat_len=20\nat_hex=323032362d30312d30315430303a30303a30305a\nsource=legacy\nsource_ord=101\n'
+    printf 'index=1\nteam_len=8\nteam_hex=7265636569707473\nfrom_len=8\nfrom_hex=6c65676163792d62\nto_len=3\nto_hex=626f62\nat_len=20\nat_hex=323032362d30312d30315430303a30303a30305a\nsource=legacy\nsource_ord=102\n'
+    printf 'index=2\nteam_len=8\nteam_hex=7265636569707473\nfrom_len=14\nfrom_hex=6576656e742d612d73656e646572\nto_len=3\nto_hex=626f62\nat_len=20\nat_hex=323032362d30312d30315430303a30303a30305a\nsource=event\nsource_ord=1\n'
+    printf 'index=3\nteam_len=8\nteam_hex=7265636569707473\nfrom_len=14\nfrom_hex=6576656e742d622d73656e646572\nto_len=3\nto_hex=626f62\nat_len=20\nat_hex=323032362d30312d30315430303a30303a30305a\nsource=event\nsource_ord=2\n'
+  } >"$expected_file"
+  [ "$actual" = "$(shasum -a 256 "$expected_file" | awk '{print $1}')" ]
 }
 
 @test "public records and private receipt material come from one SQLite snapshot" {

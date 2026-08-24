@@ -416,7 +416,7 @@ assert_crash_marker() {
 }
 
 @test "receipt vectors are complete, byte-stable, and distinguish each bound field" {
-  local vector material expected actual
+  local vector material expected actual rows batch payload
   for vector in batch-base batch-id-boundary batch-id-changed batch-body-changed \
     frame-base frame-sender-changed frame-timestamp-changed \
     frame-source-legacy frame-source-ord-changed frame-payload-base payload-base; do
@@ -446,6 +446,27 @@ assert_crash_marker() {
   issued="$(printf '%s\n' "$payload" | awk -F= '$1 == "issued_at" { print $2 }')"
   expires="$(printf '%s\n' "$payload" | awk -F= '$1 == "expires_at" { print $2 }')"
   [ $((expires - issued)) -eq 900 ]
+
+  agmsg_receipt_resolve_runtime
+  rows="$BATS_TEST_TMPDIR/vector.rows"
+  batch="$BATS_TEST_TMPDIR/vector.batch"
+  for vector in batch-base batch-id-boundary batch-id-changed batch-body-changed; do
+    printf '0|74|61|72|323032362d30312d30325430333a30343a30355a|event|7|%s|%s\n' \
+      "$(fixture_field "$vector" input_id_hex)" \
+      "$(fixture_field "$vector" input_body_hex)" >"$rows"
+    _agmsg_receipt_canonicalize batch "$rows" "$batch"
+    [ "$(xxd -p -c 1000000 "$batch" | tr -d '\n')" = "$(fixture_field "$vector" material_hex)" ]
+    [ "$(shasum -a 256 "$batch" | awk '{print $1}')" = "$(fixture_field "$vector" sha256)" ]
+  done
+
+  payload="$BATS_TEST_TMPDIR/vector.payload"
+  _agmsg_receipt_canonicalize payload "$payload" \
+    0123456789abcdef0123456789abcdef \
+    abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 \
+    7465616d2d61 626f62 1 \
+    "$(fixture_field batch-base sha256)" "$(fixture_field frame-payload-base sha256)" \
+    42 1700000000 1700000900 00112233445566778899aabbccddeeff
+  [ "$(xxd -p -c 1000000 "$payload" | tr -d '\n')" = "$(fixture_field payload-base material_hex)" ]
 }
 
 @test "SQLite exposes the complete optional receipt ABI and exact capability token" {
