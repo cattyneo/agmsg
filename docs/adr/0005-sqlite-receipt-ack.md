@@ -52,20 +52,10 @@ Status outcomes are mutation-free. Bounded issue and ack are data operations:
 all failures are non-zero with zero stdout and a bounded, non-sensitive stderr.
 No diagnostic contains key bytes or a receipt token.
 
-For a ready store, status has this exact four-line public output; the final
-line is the §1.4 status name:
-
-```
-receipt_schema=1
-store_generation=<32 lower hex>
-key_sha256=<64 lower hex>
-ok
-```
-
-This is the only public identity projection. It lets a caller compare a
-re-init's schema, store generation, and public-key fingerprint without seeing
-key material. Every non-ready result emits only its final status name on
-stdout.
+For a ready store, `storage_receipt_status` stdout is exactly `ok`. Every
+non-ready result likewise emits only its final §1.4 status name on stdout.
+Status deliberately has no public identity projection; callers must not parse
+private receipt state through this optional control ABI.
 
 ### Receipt v1 canonical bytes
 
@@ -182,6 +172,14 @@ identity.
 
 The receipt state layout is fixed under the selected SQLite storage directory:
 `receipt-v1/private.pem`, `receipt-v1/public.pem`, and `receipt-v1/init.lock`.
+The SQLite-private metadata schema is fixed as
+`receipt_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)` with exactly these
+required keys: `schema_version` (the decimal `1`), `store_generation` (32
+lowercase hex), and `public_key_sha256` (the 64 lowercase-hex SHA-256 of the
+exact `public.pem` bytes). This schema is state-validation data, not a public
+storage ABI or a status output format. Isolated storage validation may query it
+read-only together with the public-key file hash; production callers use only
+the `ok`/existing-error status vocabulary.
 The receipt directory is non-symlink, owner-owned, and `0700`. The parent
 storage directory itself is also non-symlink and owner-owned, with no
 group/world write bit. Key files and the SQLite DB are non-symlink, regular,
@@ -222,6 +220,17 @@ the next validated dead-owner reclaim: pre-link leaves a validated staging
 record, post-link/pre-unlink leaves the validated two-link pair, and
 post-acquisition leaves the valid fixed lock. After acquiring or reclaiming,
 init rechecks complete state before writing.
+
+The crash matrix runs on a POSIX runner with shell command-shadowing, SQLite,
+and OpenSSL 3. It launches a real initializer and test-side wrappers for
+`ln`, OpenSSL, and `sqlite3` pause only at observed filesystem/metadata
+milestones before `SIGKILL`: receipt directory, private key, public key,
+`receipt_meta` schema, store-generation row, pre-link, post-link/pre-unlink,
+and post-acquisition. Native Git Bash cannot provide these POSIX process and
+path semantics, so its unsupported receipt behavior is tested on a native Git
+Bash runner instead. PID reuse likewise needs a PID namespace to induce
+safely; its conservative refusal requires such a runner, and is otherwise a
+documented platform-conditional test.
 
 OpenSSL 3 and `xxd` are mandatory runtime dependencies. The receipt-only
 `AGMSG_RECEIPT_OPENSSL` and `AGMSG_RECEIPT_XXD` overrides, when set, must each

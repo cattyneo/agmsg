@@ -54,7 +54,7 @@ assert_receipt_abi() {
 assert_status() {
   local expected_status="$1" expected_output="$2"
   [ "$status" -eq "$expected_status" ]
-  [ "$(printf '%s\n' "$output" | tail -1)" = "$expected_output" ]
+  [ "$output" = "$expected_output" ]
 }
 
 # The v1 state paths are deliberately fixed rather than discovered by a glob:
@@ -77,21 +77,27 @@ file_links() {
   esac
 }
 
-status_value() {
+receipt_meta_value() {
   local key="$1"
-  printf '%s\n' "$output" | awk -F= -v key="$key" '$1 == key { print substr($0, length(key) + 2) }'
+  sqlite3 "$(agmsg_db_path receipts)" \
+    "SELECT value FROM receipt_meta WHERE key = '$key';" | tr -d '\r'
+}
+
+read_receipt_identity() {
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'receipt_meta';" | tr -d '\r')" = 1 ]
+  [ "$(receipt_meta_value schema_version)" = 1 ]
+  [[ "$(receipt_meta_value store_generation)" =~ ^[0-9a-f]{32}$ ]]
+  [[ "$(receipt_meta_value public_key_sha256)" =~ ^[0-9a-f]{64}$ ]]
+  [ "$(shasum -a 256 "$(receipt_public_key)" | awk '{print $1}')" = \
+    "$(receipt_meta_value public_key_sha256)" ]
+  RECEIPT_IDENTITY="$(receipt_meta_value schema_version):$(receipt_meta_value store_generation):$(receipt_meta_value public_key_sha256)"
 }
 
 assert_ready_identity() {
   run --separate-stderr storage_receipt_status receipts
   assert_status 0 ok
-  [ "$(printf '%s\n' "$output" | sed -n '1p')" = receipt_schema=1 ]
-  [[ "$(printf '%s\n' "$output" | sed -n '2p')" =~ ^store_generation=[0-9a-f]{32}$ ]]
-  [[ "$(printf '%s\n' "$output" | sed -n '3p')" =~ ^key_sha256=[0-9a-f]{64}$ ]]
-  [ "$(printf '%s\n' "$output" | sed -n '4p')" = ok ]
-  [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" = 4 ]
-  [ "$("$(command -v openssl)" dgst -sha256 -r "$(receipt_public_key)" | awk '{print $1}')" = "$(status_value key_sha256)" ]
-  RECEIPT_IDENTITY="$(status_value receipt_schema):$(status_value store_generation):$(status_value key_sha256)"
+  read_receipt_identity
 }
 
 init_ready() {
@@ -104,6 +110,33 @@ init_ready() {
 assert_corrupt_status() {
   run --separate-stderr storage_receipt_status receipts
   assert_status 12 corrupt_state
+}
+
+assert_corrupt_init() {
+  run --separate-stderr storage_receipt_init receipts
+  assert_status 12 corrupt_state
+}
+
+capture_receipt_command() {
+  local label="$1"
+  shift
+  CAPTURE_STDOUT="$BATS_TEST_TMPDIR/${label}.stdout"
+  CAPTURE_STDERR="$BATS_TEST_TMPDIR/${label}.stderr"
+  if "$@" >"$CAPTURE_STDOUT" 2>"$CAPTURE_STDERR"; then
+    CAPTURE_STATUS=0
+  else
+    CAPTURE_STATUS=$?
+  fi
+}
+
+assert_safe_diagnostics() {
+  local forbidden="${1:-}"
+  [ "$(wc -c <"$CAPTURE_STDOUT" | tr -d ' ')" -le 4096 ]
+  [ "$(wc -c <"$CAPTURE_STDERR" | tr -d ' ')" -le 4096 ]
+  ! grep -Eq -- '-----BEGIN|PRIVATE KEY|PUBLIC KEY' "$CAPTURE_STDOUT" "$CAPTURE_STDERR"
+  if [ -n "$forbidden" ]; then
+    ! grep -Fq -- "$forbidden" "$CAPTURE_STDOUT" "$CAPTURE_STDERR"
+  fi
 }
 
 dead_pid() {
@@ -136,6 +169,74 @@ receipt_test_openssl() {
     case "$version" in OpenSSL\ 3.*) printf '%s' "$candidate"; return 0 ;; esac
   done
   return 1
+}
+
+# These wrappers exercise actual initializer processes at crash boundaries. They
+# are test-side PATH/override commands, not production hooks. Each wrapper
+# pauses only after it has observed the named public filesystem milestone.
+make_crash_wrappers() {
+  local wrapper_dir="$BATS_TEST_TMPDIR/receipt-crash-bin"
+  mkdir -p "$wrapper_dir"
+  export RECEIPT_CRASH_MARKER="$BATS_TEST_TMPDIR/receipt-crash.marker"
+  export RECEIPT_CRASH_RELEASE="$BATS_TEST_TMPDIR/receipt-crash.release"
+  export RECEIPT_REAL_LN="$(command -v ln)"
+  export RECEIPT_REAL_OPENSSL="$(receipt_test_openssl)"
+  export RECEIPT_REAL_SQLITE="$(command -v sqlite3)"
+
+  printf '%s\n' '#!/bin/bash' \
+    'pause() { : >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do sleep 0.05; done; }' \
+    'if [ "${RECEIPT_CRASH_POINT:-}" = pre-link ]; then pause; fi' \
+    '"$RECEIPT_REAL_LN" "$@"' \
+    'rc=$?' \
+    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = post-link-before-unlink ]; then pause; fi' \
+    'exit "$rc"' >"$wrapper_dir/ln"
+  printf '%s\n' '#!/bin/bash' \
+    'pause() { : >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do sleep 0.05; done; }' \
+    'is_genpkey=no; is_public=no' \
+    'for arg in "$@"; do [ "$arg" = genpkey ] && is_genpkey=yes; [ "$arg" = -pubout ] && is_public=yes; done' \
+    'if [ "$is_genpkey" = yes ] && { [ "${RECEIPT_CRASH_POINT:-}" = directory-created ] || [ "${RECEIPT_CRASH_POINT:-}" = after-acquisition ]; }; then pause; fi' \
+    '"$RECEIPT_REAL_OPENSSL" "$@"' \
+    'rc=$?' \
+    'if [ "$rc" -eq 0 ] && [ "$is_genpkey" = yes ] && [ "${RECEIPT_CRASH_POINT:-}" = private-created ]; then pause; fi' \
+    'if [ "$rc" -eq 0 ] && [ "$is_public" = yes ] && [ "${RECEIPT_CRASH_POINT:-}" = public-created ]; then pause; fi' \
+    'exit "$rc"' >"$wrapper_dir/openssl"
+  printf '%s\n' '#!/bin/bash' \
+    'pause() { : >"$RECEIPT_CRASH_MARKER"; while [ ! -e "$RECEIPT_CRASH_RELEASE" ]; do sleep 0.05; done; }' \
+    '"$RECEIPT_REAL_SQLITE" "$@"' \
+    'rc=$?' \
+    'db="${AGMSG_STORAGE_PATH}/messages.db"' \
+    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = schema-created ] && [ -f "$db" ] && [ "$("$RECEIPT_REAL_SQLITE" "$db" "SELECT COUNT(*) FROM sqlite_master WHERE type=char(116)||char(97)||char(98)||char(108)||char(101) AND name=char(114)||char(101)||char(99)||char(101)||char(105)||char(112)||char(116)||char(95)||char(109)||char(101)||char(116)||char(97);" 2>/dev/null)" = 1 ]; then pause; fi' \
+    'if [ "$rc" -eq 0 ] && [ "${RECEIPT_CRASH_POINT:-}" = generation-created ] && [ -f "$db" ] && "$RECEIPT_REAL_SQLITE" "$db" "SELECT value FROM receipt_meta WHERE key=char(115)||char(116)||char(111)||char(114)||char(101)||char(95)||char(103)||char(101)||char(110)||char(101)||char(114)||char(97)||char(116)||char(105)||char(111)||char(110);" 2>/dev/null | grep -Eq "^[0-9a-f]{32}$"; then pause; fi' \
+    'exit "$rc"' >"$wrapper_dir/sqlite3"
+  chmod 700 "$wrapper_dir/ln" "$wrapper_dir/openssl" "$wrapper_dir/sqlite3"
+  RECEIPT_CRASH_BIN="$wrapper_dir"
+}
+
+start_crashable_init() {
+  local point="$1"
+  assert_receipt_abi
+  make_crash_wrappers
+  RECEIPT_CRASH_POINT="$point" PATH="$RECEIPT_CRASH_BIN:$PATH" \
+    AGMSG_RECEIPT_OPENSSL="$RECEIPT_CRASH_BIN/openssl" \
+    AGMSG_RECEIPT_XXD="$(command -v xxd)" \
+    storage_receipt_init receipts >"$BATS_TEST_TMPDIR/crash-init.stdout" \
+    2>"$BATS_TEST_TMPDIR/crash-init.stderr" &
+  RECEIPT_INIT_PID=$!
+  local attempt
+  for attempt in $(seq 1 100); do
+    [ -e "$RECEIPT_CRASH_MARKER" ] && return 0
+    kill -0 "$RECEIPT_INIT_PID" 2>/dev/null || break
+    sleep 0.05
+  done
+  kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
+  wait "$RECEIPT_INIT_PID" 2>/dev/null || true
+  false
+}
+
+kill_crashable_init() {
+  kill -9 "$RECEIPT_INIT_PID"
+  wait "$RECEIPT_INIT_PID" 2>/dev/null || true
+  [ -s "$RECEIPT_CRASH_MARKER" ]
 }
 
 @test "receipt vectors are complete, byte-stable, and distinguish each bound field" {
@@ -192,7 +293,7 @@ receipt_test_openssl() {
   [ "$after" = "$before" ]
 }
 
-@test "receipt init makes status ready, preserves identity on re-init, and emits no key material" {
+@test "receipt init makes exact-ok status, preserves private identity on re-init, and emits no key material" {
   init_ready
   local before="$RECEIPT_IDENTITY"
   [[ "$output" != *"BEGIN"* ]]
@@ -277,6 +378,35 @@ receipt_test_openssl() {
   [ "$after" = "$before" ]
 }
 
+@test "receipt diagnostics keep init, status, issue, and ack stdout and stderr bounded and non-sensitive" {
+  assert_receipt_abi
+  capture_receipt_command init storage_receipt_init receipts
+  [ "$CAPTURE_STATUS" -eq 0 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = ok ]
+  [ ! -s "$CAPTURE_STDERR" ]
+  assert_safe_diagnostics
+
+  capture_receipt_command status storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 0 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = ok ]
+  [ ! -s "$CAPTURE_STDERR" ]
+  assert_safe_diagnostics
+
+  storage_send receipts alice bob first >/dev/null
+  local later forbidden_receipt=not-a-receipt-token
+  later="$(storage_send receipts alice bob later)"
+  capture_receipt_command issue-refusal storage_get_message_bounded receipts bob "$later" \
+    --max-body-bytes 4096 --issue-receipt
+  [ "$CAPTURE_STATUS" -ne 0 ]
+  [ ! -s "$CAPTURE_STDOUT" ]
+  assert_safe_diagnostics
+
+  capture_receipt_command ack-refusal storage_ack_receipt receipts bob --receipt "$forbidden_receipt"
+  [ "$CAPTURE_STATUS" -ne 0 ]
+  [ ! -s "$CAPTURE_STDOUT" ]
+  assert_safe_diagnostics "$forbidden_receipt"
+}
+
 @test "ordinary bounded reads never initialize receipt state" {
   storage_send receipts alice bob ordinary >/dev/null
   local id before after
@@ -309,18 +439,24 @@ receipt_test_openssl() {
 
 @test "missing full key pair is corrupt state and is never regenerated by status" {
   init_ready
+  local before="$RECEIPT_IDENTITY"
   rm -f "$(receipt_private_key)" "$(receipt_public_key)"
   assert_corrupt_status
+  assert_corrupt_init
   [ ! -e "$(receipt_private_key)" ]
   [ ! -e "$(receipt_public_key)" ]
+  [ "$(receipt_meta_value schema_version):$(receipt_meta_value store_generation):$(receipt_meta_value public_key_sha256)" = "$before" ]
 }
 
 @test "half key state is corrupt and is never auto-repaired" {
   init_ready
+  local before="$RECEIPT_IDENTITY"
   rm -f "$(receipt_private_key)"
   assert_corrupt_status
+  assert_corrupt_init
   [ ! -e "$(receipt_private_key)" ]
   [ -f "$(receipt_public_key)" ]
+  [ "$(receipt_meta_value schema_version):$(receipt_meta_value store_generation):$(receipt_meta_value public_key_sha256)" = "$before" ]
 }
 
 @test "replaced unparsable key is corrupt state" {
@@ -620,6 +756,93 @@ receipt_test_openssl() {
   [ -f "$lock" ]
   kill "$owner_pid" 2>/dev/null || true
   wait "$owner_pid" 2>/dev/null || true
+}
+
+# These require a POSIX runner with executable command-shadowing semantics;
+# native Git Bash has its own unsupported receipt boundary and is covered below.
+skip_unless_posix_crash_runner() {
+  case "$(uname -s)" in
+    Darwin*|Linux*) command -v sqlite3 >/dev/null && receipt_test_openssl >/dev/null || skip "requires POSIX sqlite3 and OpenSSL 3 runner" ;;
+    *) skip "requires a POSIX runner; native Git Bash is covered separately" ;;
+  esac
+}
+
+@test "real SIGKILL before lock hard-link leaves only an initializer staging record" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init pre-link
+  kill_crashable_init
+  [ -d "$(receipt_dir)" ]
+  [ -n "$(find "$(receipt_dir)" -maxdepth 1 -name '.init-stage.*' -print -quit)" ]
+  [ ! -e "$(receipt_lock)" ]
+}
+
+@test "real SIGKILL after lock hard-link preserves the exact two-link crash residue" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init post-link-before-unlink
+  kill_crashable_init
+  local stage
+  stage="$(find "$(receipt_dir)" -maxdepth 1 -name '.init-stage.*' -print -quit)"
+  [ -n "$stage" ]
+  [ -f "$(receipt_lock)" ]
+  [ "$(file_links "$stage")" -eq 2 ]
+  [ "$(file_links "$(receipt_lock)")" -eq 2 ]
+}
+
+@test "real SIGKILL after acquisition leaves only the fixed lock before key generation" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init after-acquisition
+  kill_crashable_init
+  [ -d "$(receipt_dir)" ]
+  [ -f "$(receipt_lock)" ]
+  [ "$(file_links "$(receipt_lock)")" -eq 1 ]
+  [ -z "$(find "$(receipt_dir)" -maxdepth 1 -name '.init-stage.*' -print -quit)" ]
+}
+
+@test "real SIGKILL after receipt directory creation leaves no key material" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init directory-created
+  kill_crashable_init
+  [ -d "$(receipt_dir)" ]
+  [ ! -e "$(receipt_private_key)" ]
+  [ ! -e "$(receipt_public_key)" ]
+}
+
+@test "real SIGKILL after private-key generation leaves no public key" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init private-created
+  kill_crashable_init
+  [ -f "$(receipt_private_key)" ]
+  [ ! -e "$(receipt_public_key)" ]
+}
+
+@test "real SIGKILL after public-key generation leaves the generated key pair" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init public-created
+  kill_crashable_init
+  [ -f "$(receipt_private_key)" ]
+  [ -f "$(receipt_public_key)" ]
+}
+
+@test "real SIGKILL after receipt schema creation leaves the private receipt_meta table" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init schema-created
+  kill_crashable_init
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='receipt_meta';" | tr -d '\r')" = 1 ]
+}
+
+@test "real SIGKILL after generation creation leaves the private store generation row" {
+  assert_receipt_abi
+  skip_unless_posix_crash_runner
+  start_crashable_init generation-created
+  kill_crashable_init
+  [[ "$(receipt_meta_value store_generation)" =~ ^[0-9a-f]{32}$ ]]
 }
 
 @test "SIGKILL pre-link residue is removed only when its dead staging record validates" {
