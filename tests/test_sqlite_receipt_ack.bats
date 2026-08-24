@@ -98,6 +98,14 @@ assert_zero_stdout_failure() {
   ! grep -Eq -- 'BEGIN (PRIVATE|PUBLIC) KEY|receipt=[A-Za-z0-9_-]+' "$err"
 }
 
+assert_internal_receipt_failure() {
+  local name="$1"
+  shift
+  assert_zero_stdout_failure "$name" "$@"
+  grep -Fxq -- 'agmsg receipt: cannot construct receipt' \
+    "$BATS_TEST_TMPDIR/$name.stderr"
+}
+
 @test "receipt list appends one final compact record after messages and result" {
   sql_event opaque/a alice bob first 2026-01-01T00:00:02Z
   sql_event opaque/b carol bob second 2026-01-01T00:00:03Z
@@ -340,6 +348,97 @@ SH
     --limit-items 1 --max-body-bytes 4096 --issue-receipt
   refute grep -Fq -- "$secret" "$BATS_TEST_TMPDIR/base64-partial.stderr"
   [ "$(durable_state)" = "$before" ]
+}
+
+@test "a scope encoder that prints valid hex then fails cannot issue a receipt" {
+  local opaque='opaque/scope-id:private-91bc4e72' body='scope-body-private-91bc4e72'
+  local before wrapper="$BATS_TEST_TMPDIR/xxd-scope-partial" secret='xxd-secret-stderr-91bc4e72'
+  sql_event "$opaque" alice bob "$body" 2026-01-01T00:00:00Z
+  before="$(durable_state)"
+  cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+if [ "$#" -eq 3 ] && [ "${1:-}" = -p ] && [ "${2:-}" = -c ] &&
+   [ "${3:-}" = 1000000 ]; then
+  printf '%s' 61
+  printf '%s\n' "$SCOPE_FAILURE_SECRET" >&2
+  exit 71
+fi
+exec "$REAL_RECEIPT_XXD" "$@"
+SH
+  chmod 755 "$wrapper"
+  export REAL_RECEIPT_XXD="$(command -v xxd)"
+  export SCOPE_FAILURE_SECRET="$secret"
+  export AGMSG_RECEIPT_XXD="$wrapper"
+  assert_internal_receipt_failure xxd-partial storage_list_unread_bounded receipts bob \
+    --limit-items 1 --max-body-bytes 4096 --issue-receipt
+  refute grep -Fq -- "$secret" "$BATS_TEST_TMPDIR/xxd-partial.stderr"
+  refute grep -Fq -- "$opaque" "$BATS_TEST_TMPDIR/xxd-partial.stderr"
+  refute grep -Fq -- "$body" "$BATS_TEST_TMPDIR/xxd-partial.stderr"
+  [ "$(durable_state)" = "$before" ]
+}
+
+@test "nonce and hash failures emit one bounded non-sensitive internal diagnostic" {
+  local before wrapper="$BATS_TEST_TMPDIR/openssl-internal-failure"
+  local secret='openssl-internal-secret-91bc4e72'
+  sql_event internal-failure alice bob internal-body 2026-01-01T00:00:00Z
+  before="$(durable_state)"
+  cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+case "${INTERNAL_FAILURE_MODE:-}: $* " in
+  'rand: rand -hex 16 ')
+    printf '%s' 00112233445566778899aabbccddeeff
+    printf '%s\n' "$INTERNAL_FAILURE_SECRET" >&2
+    exit 71
+    ;;
+  hash:*' dgst -sha256 -r '*'agmsg-receipt-issue.'*)
+    printf '%s  ignored\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    printf '%s\n' "$INTERNAL_FAILURE_SECRET" >&2
+    exit 71
+    ;;
+esac
+exec "$REAL_RECEIPT_OPENSSL" "$@"
+SH
+  chmod 755 "$wrapper"
+  export REAL_RECEIPT_OPENSSL="$(command -v openssl)"
+  export INTERNAL_FAILURE_SECRET="$secret"
+  export AGMSG_RECEIPT_OPENSSL="$wrapper"
+
+  export INTERNAL_FAILURE_MODE=rand
+  assert_internal_receipt_failure rand-failure storage_list_unread_bounded receipts bob \
+    --limit-items 1 --max-body-bytes 4096 --issue-receipt
+  refute grep -Fq -- "$secret" "$BATS_TEST_TMPDIR/rand-failure.stderr"
+  [ "$(durable_state)" = "$before" ]
+
+  export INTERNAL_FAILURE_MODE=hash
+  assert_internal_receipt_failure hash-failure storage_list_unread_bounded receipts bob \
+    --limit-items 1 --max-body-bytes 4096 --issue-receipt
+  refute grep -Fq -- "$secret" "$BATS_TEST_TMPDIR/hash-failure.stderr"
+  [ "$(durable_state)" = "$before" ]
+}
+
+@test "canonical payload and token syntax failures use the internal diagnostic" {
+  local snapshot wrapper="$BATS_TEST_TMPDIR/openssl-invalid-base64"
+  snapshot='{"type":"bounded_unread_result","selected_count":1,"selected_body_bytes":1,"remaining_count":0,"remaining_body_bytes":0,"limit_items":1,"max_body_bytes":4096}
+__agmsg_receipt_meta|not-a-generation|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|1|1
+__agmsg_receipt_row|0|7265636569707473|616c696365|626f62|323032362d30312d30315430303a30303a30305a|event|1|6964|78'
+  printf '%s\n' "$snapshot" | assert_internal_receipt_failure payload-syntax \
+    _agmsg_receipt_issue_stream receipts bob
+
+  sql_event token-syntax alice bob body 2026-01-01T00:00:00Z
+  cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = base64 ]; then
+  printf '%s' '***'
+  exit 0
+fi
+exec "$REAL_RECEIPT_OPENSSL" "$@"
+SH
+  chmod 755 "$wrapper"
+  export REAL_RECEIPT_OPENSSL="$(command -v openssl)"
+  export AGMSG_RECEIPT_OPENSSL="$wrapper"
+  assert_internal_receipt_failure token-syntax storage_list_unread_bounded receipts bob \
+    --limit-items 1 --max-body-bytes 4096 --issue-receipt
+  refute grep -Fq -- '***' "$BATS_TEST_TMPDIR/token-syntax.stderr"
 }
 
 @test "duplicate and malformed snapshot rows fail before stdout" {

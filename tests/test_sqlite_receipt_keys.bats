@@ -476,7 +476,10 @@ assert_crash_marker() {
   [ "$status" -eq 0 ]
   local capability_line
   capability_line="$(printf '%s\n' "$output" | awk -F= '$1 == "capabilities" { print; count++ } END { exit count == 1 ? 0 : 1 }')"
-  [[ ",${capability_line#capabilities=}," == *",sqlite-receipt-ack-v1,"* ]]
+  case ",${capability_line#capabilities=}," in
+    *',sqlite-receipt-ack-v1,'*) ;;
+    *) return 1 ;;
+  esac
   [ "$(printf '%s' "${capability_line#capabilities=}" | tr ',' '\n' | sort | uniq -d | wc -l | tr -d ' ')" = 0 ]
 }
 
@@ -498,8 +501,8 @@ assert_crash_marker() {
   [ "$(sqlite3 "$(agmsg_db_path receipts)" \
     "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('receipt_nonces') ORDER BY cid);")" = \
     nonce,payload_sha256,store_generation,team_sha256,recipient_sha256,batch_sha256,frame_sha256,expires_at,committed_at ]
-  [[ "$output" != *"BEGIN"* ]]
-  [[ "$output" != *"PRIVATE"* ]]
+  refute grep -Fq -- BEGIN <<<"$output"
+  refute grep -Fq -- PRIVATE <<<"$output"
 
   run --separate-stderr storage_receipt_init receipts
   assert_status 0 ok
@@ -600,7 +603,11 @@ assert_crash_marker() {
   [ "$status" -eq 0 ]
   [ "$(printf '%s\n' "$output" | tail -1 | jq -r .type)" = bounded_unread_receipt ]
   receipt="$(printf '%s\n' "$output" | tail -1 | jq -r .receipt)"
-  [[ "$receipt" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]
+  case "$receipt" in
+    *[!A-Za-z0-9_.-]*|.*|*.|*.*.*) return 1 ;;
+    *.*) ;;
+    *) return 1 ;;
+  esac
   [ "${#receipt}" -le 2048 ]
   [ "$(printf '%s\n' "$output" | tail -1 | jq -r .receipt_version)" = 1 ]
   [ "$(printf '%s\n' "$output" | tail -1 | jq -r .selected_count)" = 1 ]
@@ -1294,7 +1301,7 @@ skip_unless_posix_crash_runner() {
       storage_describe
     '
   [ "$status" -eq 0 ]
-  [[ "$output" != *"sqlite-receipt-ack-v1"* ]]
+  refute grep -Fq -- sqlite-receipt-ack-v1 <<<"$output"
 
   phase1_list="$(storage_list_unread_bounded receipts bob --limit-items 1 --max-body-bytes 4096)"
   id="$(printf '%s\n' "$phase1_list" | jq -r 'select(.type == "message_sent") | .id')"
