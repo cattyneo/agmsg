@@ -128,18 +128,30 @@ fixture_field() {
   ' "$BATS_TEST_DIRNAME/fixtures/receipt-v1-vectors.txt"
 }
 
-receipt_abi_required() {
+receipt_state_abi_required() {
   local fn
-  for fn in storage_receipt_init storage_receipt_status storage_ack_receipt; do
+  for fn in storage_receipt_init storage_receipt_status; do
     declare -F "$fn" >/dev/null || {
-      printf 'missing optional receipt function: %s\n' "$fn" >&2
+      printf 'missing optional receipt state function: %s\n' "$fn" >&2
       return 1
     }
   done
 }
 
-assert_receipt_abi() {
-  receipt_abi_required
+receipt_ack_abi_required() {
+  declare -F storage_ack_receipt >/dev/null || {
+    printf 'missing optional receipt acknowledgement function: storage_ack_receipt\n' >&2
+    return 1
+  }
+}
+
+assert_receipt_state_abi() {
+  receipt_state_abi_required
+}
+
+assert_receipt_complete_abi() {
+  receipt_state_abi_required
+  receipt_ack_abi_required
 }
 
 assert_status() {
@@ -192,7 +204,7 @@ assert_ready_identity() {
 }
 
 init_ready() {
-  assert_receipt_abi
+  assert_receipt_state_abi
   run --separate-stderr storage_receipt_init receipts
   assert_status 0 ok
   assert_ready_identity
@@ -319,7 +331,7 @@ make_crash_wrappers() {
 
 start_crashable_init() {
   local point="$1"
-  assert_receipt_abi
+  assert_receipt_state_abi
   make_crash_wrappers
   RECEIPT_CRASH_POINT="$point" PATH="$RECEIPT_CRASH_BIN:$PATH" \
     AGMSG_RECEIPT_OPENSSL="$RECEIPT_CRASH_BIN/openssl" \
@@ -398,7 +410,7 @@ assert_crash_marker() {
 }
 
 @test "SQLite exposes the complete optional receipt ABI and exact capability token" {
-  assert_receipt_abi
+  assert_receipt_complete_abi
 
   run storage_describe
   [ "$status" -eq 0 ]
@@ -409,7 +421,7 @@ assert_crash_marker() {
 }
 
 @test "receipt status is non-mutating and reports uninitialized state through the existing vocabulary" {
-  assert_receipt_abi
+  assert_receipt_state_abi
   local before after
   before="$(store_fingerprint)"
   run --separate-stderr storage_receipt_status receipts
@@ -421,6 +433,11 @@ assert_crash_marker() {
 @test "receipt init makes exact-ok status, preserves private identity on re-init, and emits no key material" {
   init_ready
   local before="$RECEIPT_IDENTITY"
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" \
+    "SELECT COUNT(*) FROM receipt_meta;")" = 3 ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" \
+    "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_table_info('receipt_nonces') ORDER BY cid);")" = \
+    nonce,payload_sha256,store_generation,team_sha256,recipient_sha256,batch_sha256,frame_sha256,expires_at,committed_at ]
   [[ "$output" != *"BEGIN"* ]]
   [[ "$output" != *"PRIVATE"* ]]
 
@@ -454,7 +471,7 @@ assert_crash_marker() {
 }
 
 @test "receipt status fails closed when the exact claim functions are loaded" {
-  assert_receipt_abi
+  assert_receipt_state_abi
   storage_receipt_init receipts >/dev/null
   agmsg_claim_next() { :; }
   agmsg_ack_claim() { :; }
@@ -464,8 +481,57 @@ assert_crash_marker() {
   assert_status 13 runtime_error
 }
 
+@test "receipt status fails closed when the exact SQLite claims table exists" {
+  init_ready
+  sqlite3 "$(agmsg_db_path receipts)" \
+    "CREATE TABLE claims(scope TEXT, task_id TEXT, holder TEXT);"
+
+  run --separate-stderr storage_receipt_status receipts
+  assert_status 13 runtime_error
+}
+
+@test "receipt status rejects claim capability tokens and malformed capability metadata" {
+  init_ready
+  storage_describe() {
+    printf '%s\n' 'name=sqlite' 'capabilities=stage1-sync,message-claim-v2'
+  }
+  run --separate-stderr storage_receipt_status receipts
+  assert_status 13 runtime_error
+
+  storage_describe() {
+    printf '%s\n' 'name=sqlite' 'capabilities=stage1-sync,stage1-sync'
+  }
+  run --separate-stderr storage_receipt_status receipts
+  assert_status 12 corrupt_state
+}
+
+@test "unrelated lease capability does not trip the closed claim predicate" {
+  init_ready
+  storage_describe() {
+    printf '%s\n' 'name=sqlite' 'capabilities=stage1-sync,lease-audit'
+  }
+  run --separate-stderr storage_receipt_status receipts
+  assert_status 0 ok
+}
+
+@test "repo-relative exact claims library marker disables receipt status" {
+  init_ready
+  local copy="$BATS_TEST_TMPDIR/skill-copy"
+  mkdir -p "$copy"
+  cp -R "$TEST_SKILL_DIR/scripts" "$copy/"
+  : >"$copy/scripts/lib/claims.sh"
+
+  run env AGMSG_STORAGE_DRIVER=sqlite AGMSG_STORAGE_PATH="$AGMSG_STORAGE_PATH" \
+    AGMSG_CONFIG="$AGMSG_CONFIG" SKILL_DIR="$copy" /bin/bash -c '
+      source "$SKILL_DIR/scripts/lib/storage.sh"
+      agmsg_storage_load
+      storage_receipt_status receipts
+    '
+  assert_status 13 runtime_error
+}
+
 @test "SQLite receipt issuance is opt-in, final, bounded, and read-only" {
-  assert_receipt_abi
+  assert_receipt_state_abi
   storage_receipt_init receipts >/dev/null
   storage_send receipts alice bob first >/dev/null
   local before after receipt
@@ -483,7 +549,7 @@ assert_crash_marker() {
 }
 
 @test "empty list has no receipt and later-row show with a receipt fails without stdout" {
-  assert_receipt_abi
+  assert_receipt_state_abi
   storage_receipt_init receipts >/dev/null
   run storage_list_unread_bounded receipts bob --limit-items 10 --max-body-bytes 4096 --issue-receipt
   [ "$status" -eq 0 ]
@@ -497,7 +563,8 @@ assert_crash_marker() {
 }
 
 @test "ack validates through the optional operation and never writes stdout on failure" {
-  assert_receipt_abi
+  assert_receipt_state_abi
+  receipt_ack_abi_required
   storage_receipt_init receipts >/dev/null
   local before after
   before="$(store_fingerprint)"
@@ -508,8 +575,8 @@ assert_crash_marker() {
   [ "$after" = "$before" ]
 }
 
-@test "receipt diagnostics keep init, status, issue, and ack stdout and stderr bounded and non-sensitive" {
-  assert_receipt_abi
+@test "receipt state diagnostics keep init and status bounded and non-sensitive" {
+  assert_receipt_state_abi
   capture_receipt_command init storage_receipt_init receipts
   [ "$CAPTURE_STATUS" -eq 0 ]
   [ "$(cat "$CAPTURE_STDOUT")" = ok ]
@@ -521,7 +588,12 @@ assert_crash_marker() {
   [ "$(cat "$CAPTURE_STDOUT")" = ok ]
   [ ! -s "$CAPTURE_STDERR" ]
   assert_safe_diagnostics
+}
 
+@test "receipt issue and ack refusals keep stdout empty and diagnostics bounded" {
+  assert_receipt_state_abi
+  receipt_ack_abi_required
+  storage_receipt_init receipts >/dev/null
   storage_send receipts alice bob first >/dev/null
   local later forbidden_receipt="$DIAGNOSTIC_SENTINEL"
   later="$(storage_send receipts alice bob later)"
@@ -811,8 +883,61 @@ assert_crash_marker() {
   [ "$after" = "$before" ]
 }
 
+@test "relative runtime overrides fail without falling back to platform candidates" {
+  init_ready
+  export AGMSG_RECEIPT_OPENSSL=openssl
+  capture_receipt_command relative-openssl storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 10 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = missing_deps ]
+  assert_safe_diagnostics
+
+  unset AGMSG_RECEIPT_OPENSSL
+  export AGMSG_RECEIPT_XXD=xxd
+  capture_receipt_command relative-xxd storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 10 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = missing_deps ]
+  assert_safe_diagnostics
+}
+
+@test "OpenSSL 3 branding without Ed25519 capability is rejected" {
+  init_ready
+  local fake="$BATS_TEST_TMPDIR/openssl-no-ed25519"
+  export REAL_RECEIPT_OPENSSL="$(receipt_test_openssl)"
+  printf '%s\n' '#!/bin/bash' \
+    'if [ "${1:-}" = genpkey ]; then printf "%s\n" "$DIAGNOSTIC_SECRET_FRAGMENT" >&2; exit 1; fi' \
+    'exec "$REAL_RECEIPT_OPENSSL" "$@"' >"$fake"
+  chmod 700 "$fake"
+  export AGMSG_RECEIPT_OPENSSL="$fake"
+
+  capture_receipt_command no-ed25519 storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 10 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = missing_deps ]
+  assert_safe_diagnostics
+}
+
+@test "xxd override that corrupts the 258-byte round trip is rejected" {
+  init_ready
+  local fake="$BATS_TEST_TMPDIR/xxd-corrupt"
+  export REAL_RECEIPT_XXD="$(command -v xxd)"
+  printf '%s\n' '#!/bin/bash' \
+    'if [ "${1:-}" = -r ] && [ "${2:-}" = -p ]; then' \
+    '  "$REAL_RECEIPT_XXD" "$@" || exit' \
+    '  for argument in "$@"; do output="$argument"; done' \
+    '  printf x >>"$output"' \
+    '  exit 0' \
+    'fi' \
+    'exec "$REAL_RECEIPT_XXD" "$@"' >"$fake"
+  chmod 700 "$fake"
+  export AGMSG_RECEIPT_XXD="$fake"
+
+  capture_receipt_command corrupt-xxd storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 10 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = missing_deps ]
+  assert_safe_diagnostics
+}
+
 @test "Git Bash rejects receipt initialization as unsupported while legacy storage stays available" {
-  assert_receipt_abi
+  assert_receipt_state_abi
   skip_unless_windows "requires native Git Bash"
   storage_send receipts alice bob still-works >/dev/null
   run --separate-stderr storage_receipt_init receipts
@@ -912,7 +1037,7 @@ skip_unless_posix_crash_runner() {
 
 @test "real SIGKILL before lock hard-link leaves only an initializer staging record" {
   skip_unless_posix_crash_runner
-  assert_receipt_abi
+  assert_receipt_state_abi
   start_crashable_init pre-link
   assert_crash_marker pre-link "$(receipt_lock)"
   kill_crashable_init
@@ -923,7 +1048,7 @@ skip_unless_posix_crash_runner() {
 
 @test "real SIGKILL after lock hard-link preserves the exact two-link crash residue" {
   skip_unless_posix_crash_runner
-  assert_receipt_abi
+  assert_receipt_state_abi
   start_crashable_init post-link-before-unlink
   assert_crash_marker post-link-before-unlink "$(receipt_lock)"
   kill_crashable_init
@@ -937,7 +1062,7 @@ skip_unless_posix_crash_runner() {
 
 @test "real SIGKILL after acquisition leaves only the fixed lock before key generation" {
   skip_unless_posix_crash_runner
-  assert_receipt_abi
+  assert_receipt_state_abi
   start_crashable_init after-acquisition
   assert_crash_marker after-acquisition "$(receipt_private_key)"
   kill_crashable_init
@@ -949,7 +1074,7 @@ skip_unless_posix_crash_runner() {
 
 @test "real SIGKILL after receipt directory creation leaves no key material" {
   skip_unless_posix_crash_runner
-  assert_receipt_abi
+  assert_receipt_state_abi
   start_crashable_init directory-created
   assert_crash_marker directory-created "$(receipt_private_key)"
   kill_crashable_init
@@ -960,7 +1085,7 @@ skip_unless_posix_crash_runner() {
 
 @test "real SIGKILL after private-key generation leaves no public key" {
   skip_unless_posix_crash_runner
-  assert_receipt_abi
+  assert_receipt_state_abi
   start_crashable_init private-created
   assert_crash_marker private-created "$(receipt_private_key)"
   kill_crashable_init
@@ -970,7 +1095,7 @@ skip_unless_posix_crash_runner() {
 
 @test "real SIGKILL after public-key generation leaves the generated key pair" {
   skip_unless_posix_crash_runner
-  assert_receipt_abi
+  assert_receipt_state_abi
   start_crashable_init public-created
   assert_crash_marker public-created "$(receipt_public_key)"
   kill_crashable_init
@@ -980,7 +1105,7 @@ skip_unless_posix_crash_runner() {
 
 @test "real SIGKILL after atomic receipt metadata commit leaves schema and all identity rows" {
   skip_unless_posix_crash_runner
-  assert_receipt_abi
+  assert_receipt_state_abi
   start_crashable_init metadata-committed
   assert_crash_marker metadata-committed "$(agmsg_db_path receipts)"
   kill_crashable_init
@@ -1025,7 +1150,7 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "PID reuse remains a conservative manual-recovery block" {
-  assert_receipt_abi
+  assert_receipt_state_abi
   skip "PID reuse cannot be induced safely without a PID namespace; v1 must refuse it conservatively"
 }
 
