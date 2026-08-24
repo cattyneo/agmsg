@@ -93,7 +93,7 @@ storage_describe() {
   # store was asked about. This is not a second way to reach the store.
   printf 'name=sqlite\n'
   printf 'backend=SQLite (WAL) event log + legacy messages table\n'
-  printf 'capabilities=stage1-sync,stage1-resync,stage2-read-state\n'
+  printf 'capabilities=stage1-sync,stage1-resync,stage2-read-state,sqlite-receipt-ack-v1\n'
   [ -z "${1-}" ] || printf 'db=%s\n' "$(_sqlite_db "$1")"
 }
 
@@ -776,6 +776,115 @@ ORDER BY phase,ord;
 SQL
 }
 
+# Private acknowledgement snapshot. It emits only canonical hex rows and is
+# captured in an owner-only temporary directory by receipt.sh; no public record
+# is emitted and the query travels over stdin rather than argv.
+_sqlite_receipt_ack_snapshot_sql() {
+  local team="$1" agent="$2" selected="$3" cte
+  cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  cat <<SQL
+$cte,
+ordered AS (
+  SELECT u.*,row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n
+    FROM unread u
+)
+SELECT '__agmsg_receipt_row|' || (n-1) || '|' || lower(hex(CAST(team AS BLOB))) ||
+       '|' || lower(hex(CAST(from_agent AS BLOB))) || '|' || lower(hex(CAST(to_agent AS BLOB))) ||
+       '|' || lower(hex(CAST(at AS BLOB))) || '|' || CASE src WHEN 1 THEN 'event' ELSE 'legacy' END ||
+       '|' || ord || '|' || lower(hex(CAST(id AS BLOB))) || '|' || lower(hex(CAST(body AS BLOB)))
+  FROM ordered WHERE n<=$selected ORDER BY n;
+SQL
+}
+
+# Run the complete ack mutation in one sqlite3 invocation and one IMMEDIATE
+# transaction. Expected raw bytes are imported into a TEMP table through SQL
+# stdin; opaque IDs and bodies never enter argv or diagnostics.
+_sqlite_receipt_ack_transaction() {
+  local team="$1" recipient="$2" rows="$3" nonce="$4" payload_sha="$5"
+  local generation="$6" key_sha="$7" team_sha="$8" recipient_sha="$9"
+  shift 9
+  local batch_sha="$1" frame_sha="$2" frontier="$3" issued="$4" expires="$5"
+  local db tmp sql index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra
+  local cte tl al result rc=0 selected
+  db="$(_sqlite_db "$team")" || return 13
+  tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-sql.XXXXXX" 2>/dev/null)" || return 13
+  /bin/chmod 700 "$tmp" 2>/dev/null || { /bin/rm -rf -- "$tmp"; return 13; }
+  sql="$tmp/ack.sql"; ( umask 077; : >"$sql" ) || { /bin/rm -rf -- "$tmp"; return 13; }
+  tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$recipient")"
+  cte="$(_sqlite_bounded_unread_cte "$team" "$recipient")"
+  selected="$(wc -l <"$rows" | /usr/bin/tr -d ' ')"
+  {
+    printf '.bail on\n.timeout 1000\n'
+    printf 'CREATE TEMP TABLE _ack_expected(idx INTEGER PRIMARY KEY,team_hex TEXT,from_hex TEXT,to_hex TEXT,at_hex TEXT,source TEXT,source_ord INTEGER,id_hex TEXT,body_hex TEXT,id_value TEXT,body_value TEXT);\n'
+    while IFS='|' read -r index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra; do
+      [ -z "$extra" ] || return 13
+      printf "INSERT INTO _ack_expected VALUES(%s,'%s','%s','%s','%s','%s',%s,'%s','%s',CAST(X'%s' AS TEXT),CAST(X'%s' AS TEXT));\n" \
+        "$index" "$team_hex" "$from_hex" "$to_hex" "$at_hex" "$source" \
+        "$source_ord" "$id_hex" "$body_hex" "$id_hex" "$body_hex"
+    done <"$rows"
+    printf 'CREATE TEMP TABLE _ack_guard(value INTEGER CHECK(value=1));\n'
+    printf 'BEGIN IMMEDIATE;\n'
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims') THEN 1 ELSE 0 END));\n"
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN (SELECT value FROM receipt_meta WHERE key='store_generation')='%s' AND (SELECT value FROM receipt_meta WHERE key='public_key_sha256')='%s' THEN 1 ELSE 0 END));\n" "$generation" "$key_sha"
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN %s<=CAST(strftime('%%s','now') AS INTEGER) AND CAST(strftime('%%s','now') AS INTEGER)<%s THEN 1 ELSE 0 END));\n" "$issued" "$expires"
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM receipt_nonces WHERE nonce='%s') THEN 1 ELSE 0 END));\n" "$nonce"
+    printf '%s, ordered AS (SELECT u.*,row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n FROM unread u)\n' "$cte"
+    printf "INSERT INTO _ack_guard SELECT CASE WHEN
+      (SELECT COUNT(*) FROM _ack_expected)=%s
+      AND (SELECT COUNT(*) FROM ordered WHERE n<=%s)=%s
+      AND NOT EXISTS(
+        SELECT 1 FROM _ack_expected x LEFT JOIN ordered o ON o.n=x.idx+1
+         WHERE o.n IS NULL
+            OR lower(hex(CAST(o.team AS BLOB)))!=x.team_hex
+            OR lower(hex(CAST(o.from_agent AS BLOB)))!=x.from_hex
+            OR lower(hex(CAST(o.to_agent AS BLOB)))!=x.to_hex
+            OR lower(hex(CAST(o.at AS BLOB)))!=x.at_hex
+            OR CASE o.src WHEN 1 THEN 'event' ELSE 'legacy' END!=x.source
+            OR o.ord!=x.source_ord
+            OR lower(hex(CAST(o.id AS BLOB)))!=x.id_hex
+            OR lower(hex(CAST(o.body AS BLOB)))!=x.body_hex)
+      THEN 1 ELSE 0 END;\n" "$selected" "$selected" "$selected"
+    printf "DELETE FROM receipt_nonces WHERE expires_at < CAST(strftime('%%s','now') AS INTEGER)-86400;\n"
+    printf "INSERT INTO receipt_nonces(nonce,payload_sha256,store_generation,team_sha256,recipient_sha256,batch_sha256,frame_sha256,expires_at,committed_at) VALUES('%s','%s','%s','%s','%s','%s','%s',%s,CAST(strftime('%%s','now') AS INTEGER));\n" \
+      "$nonce" "$payload_sha" "$generation" "$team_sha" "$recipient_sha" \
+      "$batch_sha" "$frame_sha" "$expires"
+    printf "INSERT INTO events(type,id,team,agent,msg_id,at)
+      SELECT 'message_read','receipt-v1:%s:' || idx,'%s','%s',
+             id_value,strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now')
+        FROM _ack_expected ORDER BY idx;\n" "$nonce" "$tl" "$al"
+    printf "UPDATE messages SET read_at=strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now')
+      WHERE rowid IN (SELECT source_ord FROM _ack_expected WHERE source='legacy');\n"
+    printf "UPDATE messages SET read_at=strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now')
+      WHERE id IN (
+        SELECT e.legacy_id FROM events e JOIN _ack_expected x
+          ON x.source='event' AND e.seq=x.source_ord
+         AND lower(hex(CAST(e.id AS BLOB)))=x.id_hex
+         AND lower(hex(CAST(e.body AS BLOB)))=x.body_hex
+         AND e.legacy_id IS NOT NULL);\n"
+    printf "INSERT OR IGNORE INTO read_cursors(team,agent,local_position) VALUES('%s','%s',0);\n" "$tl" "$al"
+    printf "UPDATE read_cursors SET local_position=MAX(local_position,MIN(%s,
+      COALESCE((SELECT MIN(e.seq)-1 FROM events e
+        WHERE e.type='message_sent' AND e.team='%s' AND e.to_agent='%s' AND e.seq<=%s
+          AND NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
+            AND r.team=e.team AND r.agent='%s' AND r.msg_id=e.id)),%s)))
+      WHERE team='%s' AND agent='%s';\n" "$frontier" "$tl" "$al" "$frontier" "$al" "$frontier" "$tl" "$al"
+    printf 'COMMIT;\n'
+  } >"$sql" || { /bin/rm -rf -- "$tmp" 2>/dev/null || true; return 13; }
+
+  if result="$(LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" 2>&1)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  /bin/rm -rf -- "$tmp" 2>/dev/null || return 13
+  [ "$rc" -eq 0 ] && return 0
+  case "$result" in
+    *'database is locked'*|*'database table is locked'*|*'database schema is locked'*) return 75 ;;
+    *) return 13 ;;
+  esac
+}
+
+
 _sqlite_receipt_parse_args() {
   local issue=0 arg
   local -a filtered
@@ -826,6 +935,24 @@ _sqlite_receipt_issue_preflight() {
   agmsg_receipt_resolve_runtime || return $?
   _agmsg_receipt_capability_claim_check "$team" || return $?
   _agmsg_receipt_validate_ready "$team" || return $?
+}
+
+# Optional SQLite-only ABI. Success is deliberately silent; every refusal has
+# zero stdout and one bounded receipt diagnostic.
+storage_ack_receipt() {
+  local team="${1-}" recipient="${2-}" flag="${3-}" token="${4-}"
+  [ "$#" -eq 4 ] && [ "$flag" = --receipt ] && [ -n "$token" ] || {
+    _agmsg_receipt_ack_diagnostic invalid
+    return 13
+  }
+  if ! agmsg_validate_team_name "$team" >/dev/null 2>&1 ||
+     ! agmsg_validate_agent_name "$recipient" >/dev/null 2>&1; then
+    _agmsg_receipt_ack_diagnostic scope
+    return 13
+  fi
+  # Preserve the closed shared claim predicate's exact refusal diagnostic.
+  _agmsg_receipt_capability_claim_check "$team" || return $?
+  _agmsg_receipt_ack "$team" "$recipient" "$token"
 }
 
 _sqlite_bounded_public_result() {

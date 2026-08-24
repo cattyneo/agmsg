@@ -664,6 +664,248 @@ EOF
   }
 )
 
+_agmsg_receipt_ack_diagnostic() {
+  case "$1" in
+    invalid) _agmsg_receipt_error 'invalid receipt' ;;
+    payload_encoding) _agmsg_receipt_error 'invalid receipt payload encoding' ;;
+    signature_encoding) _agmsg_receipt_error 'invalid receipt signature encoding' ;;
+    payload) _agmsg_receipt_error 'invalid receipt payload' ;;
+    signature) _agmsg_receipt_error 'invalid receipt signature' ;;
+    scope) _agmsg_receipt_error 'receipt scope mismatch' ;;
+    identity) _agmsg_receipt_error 'receipt store identity mismatch' ;;
+    future) _agmsg_receipt_error 'receipt is not yet valid' ;;
+    expired) _agmsg_receipt_error 'receipt expired' ;;
+    prefix) _agmsg_receipt_error 'unread prefix changed' ;;
+    already) _agmsg_receipt_error 'already_committed' ;;
+    stale) _agmsg_receipt_error 'stale_or_replayed' ;;
+    busy) _agmsg_receipt_error 'SQLite backend is busy' ;;
+    *) _agmsg_receipt_error 'acknowledgement failed' ;;
+  esac
+  return 13
+}
+
+_agmsg_receipt_base64url_decode() {
+  local value="$1" destination="$2" encoded padded remainder
+  encoded="${destination}.encoded"
+  case "$value" in ''|*[!A-Za-z0-9_-]*) return 13 ;; esac
+  padded="$(printf '%s' "$value" | /usr/bin/tr '_-' '/+')" || return 13
+  remainder=$(( ${#padded} % 4 ))
+  case "$remainder" in
+    0) ;;
+    2) padded="${padded}==" ;;
+    3) padded="${padded}=" ;;
+    *) return 13 ;;
+  esac
+  ( umask 077; printf '%s' "$padded" >"$encoded" ) 2>/dev/null || return 13
+  if ! "$AGMSG_RECEIPT_OPENSSL_RESOLVED" base64 -d -A -in "$encoded" \
+      -out "$destination" >/dev/null 2>&1; then
+    /bin/rm -f -- "$encoded" "$destination" 2>/dev/null || true
+    return 13
+  fi
+  /bin/rm -f -- "$encoded" 2>/dev/null || return 13
+  [ "$(_agmsg_receipt_base64url_file "$destination")" = "$value" ] || return 13
+}
+
+_agmsg_receipt_payload_fields() {
+  local payload="$1" destination="$2" line expected key value count=0
+  : >"$destination" || return 13
+  while IFS= read -r line; do
+    count=$((count + 1))
+    case "$count" in
+      1) expected=v ;;
+      2) expected=driver ;;
+      3) expected=store_generation ;;
+      4) expected=key_sha256 ;;
+      5) expected=team_hex ;;
+      6) expected=recipient_hex ;;
+      7) expected=selected_count ;;
+      8) expected=batch_sha256 ;;
+      9) expected=frame_sha256 ;;
+      10) expected=issuance_frontier ;;
+      11) expected=issued_at ;;
+      12) expected=expires_at ;;
+      13) expected=nonce ;;
+      *) return 13 ;;
+    esac
+    key="${line%%=*}"; value="${line#*=}"
+    [ "$key" = "$expected" ] && [ "$value" != "$line" ] || return 13
+    printf '%s\n' "$value" >>"$destination" || return 13
+  done <"$payload"
+  [ "$count" -eq 13 ] || return 13
+  [ "$(sed -n '1p' "$destination")" = 1 ] || return 13
+  [ "$(sed -n '2p' "$destination")" = sqlite ] || return 13
+}
+
+_agmsg_receipt_reconcile_nonce() {
+  local team="$1" nonce="$2" payload_sha="$3" generation="$4"
+  local team_sha="$5" recipient_sha="$6" batch_sha="$7" frame_sha="$8"
+  local expires="$9" db result rc
+  db="$(_agmsg_receipt_db "$team")" || return 1
+  result="$(_agmsg_receipt_sqlite_read "$db" "
+    SELECT payload_sha256 || ':' || store_generation || ':' || team_sha256 || ':' ||
+           recipient_sha256 || ':' || batch_sha256 || ':' || frame_sha256 || ':' || expires_at
+      FROM receipt_nonces WHERE nonce='$nonce';")"
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ "$result" = "$payload_sha:$generation:$team_sha:$recipient_sha:$batch_sha:$frame_sha:$expires" ]
+}
+
+# Authenticates and acknowledges one receipt. All token material and expected
+# raw row bytes stay in an owner-only directory; the SQLite driver receives
+# only its pathname and validated scalar hashes.
+_agmsg_receipt_ack() (
+  local team="$1" recipient="$2" token="$3" tmp payload signature fields canonical
+  local payload_part signature_part generation key_sha team_hex recipient_hex selected
+  local batch_sha frame_sha frontier issued expires nonce actual_generation actual_key
+  local expected_team expected_recipient payload_sha team_sha recipient_sha now rows snapshot
+  local batch frame actual_batch actual_frame transaction_rc cleanup_status=0
+
+  [ "${#token}" -le 2048 ] || { _agmsg_receipt_ack_diagnostic invalid; exit 13; }
+  case "$token" in *.*) ;; *) _agmsg_receipt_ack_diagnostic invalid; exit 13 ;; esac
+  payload_part="${token%%.*}"; signature_part="${token#*.}"
+  [ -n "$payload_part" ] && [ -n "$signature_part" ] &&
+    [ "${signature_part#*.}" = "$signature_part" ] || {
+      _agmsg_receipt_ack_diagnostic invalid; exit 13
+    }
+  _agmsg_receipt_platform >/dev/null 2>&1 || {
+    _agmsg_receipt_ack_diagnostic invalid; exit 13
+  }
+  agmsg_receipt_resolve_runtime >/dev/null 2>&1 || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
+  tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-ack.XXXXXX" 2>/dev/null)" || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
+  /bin/chmod 700 "$tmp" 2>/dev/null || {
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
+  trap '/bin/rm -rf -- "$tmp" 2>/dev/null || true' EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  payload="$tmp/payload"; signature="$tmp/signature"; fields="$tmp/fields"
+  _agmsg_receipt_base64url_decode "$payload_part" "$payload" ||
+    _agmsg_receipt_base64url_decode "$payload_part" "$payload" || {
+    _agmsg_receipt_ack_diagnostic payload_encoding; exit 13
+  }
+  _agmsg_receipt_base64url_decode "$signature_part" "$signature" ||
+    _agmsg_receipt_base64url_decode "$signature_part" "$signature" || {
+    _agmsg_receipt_ack_diagnostic signature_encoding; exit 13
+  }
+  _agmsg_receipt_payload_fields "$payload" "$fields" || {
+    _agmsg_receipt_ack_diagnostic payload; exit 13
+  }
+  generation="$(sed -n '3p' "$fields")"; key_sha="$(sed -n '4p' "$fields")"
+  team_hex="$(sed -n '5p' "$fields")"; recipient_hex="$(sed -n '6p' "$fields")"
+  selected="$(sed -n '7p' "$fields")"; batch_sha="$(sed -n '8p' "$fields")"
+  frame_sha="$(sed -n '9p' "$fields")"; frontier="$(sed -n '10p' "$fields")"
+  issued="$(sed -n '11p' "$fields")"; expires="$(sed -n '12p' "$fields")"
+  nonce="$(sed -n '13p' "$fields")"
+  canonical="$tmp/canonical"
+  _agmsg_receipt_canonicalize payload "$canonical" "$generation" "$key_sha" \
+    "$team_hex" "$recipient_hex" "$selected" "$batch_sha" "$frame_sha" \
+    "$frontier" "$issued" "$expires" "$nonce" || {
+      _agmsg_receipt_ack_diagnostic invalid; exit 13
+    }
+  /usr/bin/cmp -s "$canonical" "$payload" || {
+    _agmsg_receipt_ack_diagnostic payload; exit 13
+  }
+
+  if ! _agmsg_receipt_validate_store "$team" >/dev/null 2>&1 ||
+     ! _agmsg_receipt_capability_claim_check "$team" >/dev/null 2>&1 ||
+     ! _agmsg_receipt_validate_ready "$team" >/dev/null 2>&1; then
+      _agmsg_receipt_ack_diagnostic failed; exit 13
+  fi
+  "$AGMSG_RECEIPT_OPENSSL_RESOLVED" pkeyutl -verify -pubin \
+    -inkey "$(_agmsg_receipt_public_key "$team")" -rawin -in "$payload" \
+    -sigfile "$signature" >/dev/null 2>&1 || {
+      _agmsg_receipt_ack_diagnostic signature; exit 13
+    }
+  expected_team="$(_agmsg_receipt_scope_hex "$team" "$tmp/team-actual.hex")" || exit 13
+  expected_recipient="$(_agmsg_receipt_scope_hex "$recipient" "$tmp/recipient-actual.hex")" || exit 13
+  [ "$team_hex" = "$expected_team" ] && [ "$recipient_hex" = "$expected_recipient" ] || {
+    _agmsg_receipt_ack_diagnostic scope; exit 13
+  }
+  actual_generation="$(_agmsg_receipt_sqlite_read "$(_agmsg_receipt_db "$team")" \
+    "SELECT value FROM receipt_meta WHERE key='store_generation';")" || exit 13
+  actual_key="$(_agmsg_receipt_public_fingerprint "$(_agmsg_receipt_public_key "$team")")" || exit 13
+  [ "$generation" = "$actual_generation" ] && [ "$key_sha" = "$actual_key" ] || {
+    _agmsg_receipt_ack_diagnostic identity; exit 13
+  }
+  payload_sha="$(_agmsg_receipt_file_sha256 "$payload")" || exit 13
+  printf '%s\n' "$team_hex" >"$tmp/team.hex"
+  "$AGMSG_RECEIPT_XXD_RESOLVED" -r -p "$tmp/team.hex" >"$tmp/team.bin" 2>/dev/null || exit 13
+  printf '%s\n' "$recipient_hex" >"$tmp/recipient.hex"
+  "$AGMSG_RECEIPT_XXD_RESOLVED" -r -p "$tmp/recipient.hex" >"$tmp/recipient.bin" 2>/dev/null || exit 13
+  team_sha="$(_agmsg_receipt_file_sha256 "$tmp/team.bin")" || exit 13
+  recipient_sha="$(_agmsg_receipt_file_sha256 "$tmp/recipient.bin")" || exit 13
+
+  now="$(/bin/date +%s)"; case "$now" in ''|*[!0-9]*) exit 13 ;; esac
+  if [ "$now" -lt "$issued" ]; then
+    _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
+      "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
+        _agmsg_receipt_ack_diagnostic already; exit 13
+      }
+    _agmsg_receipt_ack_diagnostic future; exit 13
+  fi
+  if [ "$now" -ge "$expires" ]; then
+    _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
+      "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
+        _agmsg_receipt_ack_diagnostic already; exit 13
+      }
+    [ "$now" -gt $((expires + 86400)) ] && {
+      _agmsg_receipt_ack_diagnostic stale; exit 13
+    }
+    _agmsg_receipt_ack_diagnostic expired; exit 13
+  fi
+
+  rows="$tmp/rows"
+  snapshot="$(_sqlite_data_stdin "$team" \
+    "$(_sqlite_receipt_ack_snapshot_sql "$team" "$recipient" "$selected")")" || {
+      _agmsg_receipt_ack_diagnostic failed; exit 13
+    }
+  printf '%s\n' "$snapshot" | sed -n 's/^__agmsg_receipt_row|//p' >"$rows" || exit 13
+  [ "$(wc -l <"$rows" | /usr/bin/tr -d ' ')" = "$selected" ] || {
+    _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
+      "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
+        _agmsg_receipt_ack_diagnostic already; exit 13
+      }
+    _agmsg_receipt_ack_diagnostic prefix; exit 13
+  }
+  batch="$tmp/batch"; frame="$tmp/frame"
+  _agmsg_receipt_canonicalize batch "$rows" "$batch" &&
+    _agmsg_receipt_canonicalize frame "$rows" "$frame" || exit 13
+  actual_batch="$(_agmsg_receipt_file_sha256 "$batch")" || exit 13
+  actual_frame="$(_agmsg_receipt_file_sha256 "$frame")" || exit 13
+  [ "$actual_batch" = "$batch_sha" ] && [ "$actual_frame" = "$frame_sha" ] || {
+    _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
+      "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
+        _agmsg_receipt_ack_diagnostic already; exit 13
+      }
+    _agmsg_receipt_ack_diagnostic prefix; exit 13
+  }
+
+  if ! _agmsg_receipt_validate_store "$team" >/dev/null 2>&1 ||
+     ! _agmsg_receipt_validate_ready "$team" >/dev/null 2>&1; then
+      _agmsg_receipt_ack_diagnostic failed; exit 13
+  fi
+  _sqlite_receipt_ack_transaction "$team" "$recipient" "$rows" "$nonce" \
+    "$payload_sha" "$generation" "$key_sha" "$team_sha" "$recipient_sha" "$batch_sha" \
+    "$frame_sha" "$frontier" "$issued" "$expires"
+  transaction_rc=$?
+  if [ "$transaction_rc" -ne 0 ]; then
+    _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
+      "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
+        _agmsg_receipt_ack_diagnostic already; exit 13
+      }
+    [ "$transaction_rc" -eq 75 ] && { _agmsg_receipt_ack_diagnostic busy; exit 13; }
+    _agmsg_receipt_ack_diagnostic prefix; exit 13
+  fi
+  trap - EXIT HUP INT TERM
+  /bin/rm -rf -- "$tmp" 2>/dev/null || cleanup_status=$?
+  [ "$cleanup_status" -eq 0 ] || exit 13
+  exit 0
+)
+
 _AGMSG_RECEIPT_INIT_LOCK=
 _AGMSG_RECEIPT_INIT_STAGE=
 _AGMSG_RECEIPT_INIT_NONCE=
