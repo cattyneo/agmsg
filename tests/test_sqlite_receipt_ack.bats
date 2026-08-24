@@ -612,15 +612,27 @@ ack_failure_text() {
   ack_abi_required
   sql_event ack-a alice bob first 2026-01-01T00:00:00Z
   sql_event ack-b carol bob second 2026-01-01T00:00:01Z
-  local token frontier
+  local token frontier nonce payload_sha generation team_sha recipient_sha batch_sha frame_sha expires
   token="$(issue_list_token bob)"
   decode_receipt "$token"
   frontier="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^issuance_frontier=//p')"
+  nonce="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^nonce=//p')"
+  generation="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^store_generation=//p')"
+  batch_sha="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^batch_sha256=//p')"
+  frame_sha="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^frame_sha256=//p')"
+  expires="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^expires_at=//p')"
+  payload_sha="$(shasum -a 256 "$BATS_TEST_TMPDIR/payload.bin" | awk '{print $1}')"
+  team_sha="$(printf receipts | shasum -a 256 | awk '{print $1}')"
+  recipient_sha="$(printf bob | shasum -a 256 | awk '{print $1}')"
   run storage_ack_receipt receipts bob --receipt "$token"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
   [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM receipt_nonces;")" = 1 ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT payload_sha256||':'||store_generation||':'||team_sha256||':'||recipient_sha256||':'||batch_sha256||':'||frame_sha256||':'||expires_at FROM receipt_nonces WHERE nonce='$nonce';")" = \
+    "$payload_sha:$generation:$team_sha:$recipient_sha:$batch_sha:$frame_sha:$expires" ]
   [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM events WHERE type='message_read' AND team='receipts' AND agent='bob';")" = 2 ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT group_concat(id,',') FROM (SELECT id FROM events WHERE type='message_read' ORDER BY seq);")" = \
+    "receipt-v1:$nonce:0,receipt-v1:$nonce:1" ]
   [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT local_position FROM read_cursors WHERE team='receipts' AND agent='bob';")" = "$frontier" ]
   local retry_text
   retry_text="$(ack_failure_text retained-retry bob "$token")"
@@ -956,6 +968,33 @@ SH
   [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM receipt_nonces;")" = 0 ]
   [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';")" = 0 ]
   [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM read_cursors;")" = 0 ]
+}
+
+@test "Task 4 an injected COMMIT-boundary failure cannot report or retain success" {
+  ack_abi_required
+  sql_event commit-fault alice bob body 2026-01-01T00:00:00Z
+  local token before db real_sqlite
+  token="$(issue_list_token bob)"; before="$(durable_state)"; db="$(agmsg_db_path receipts)"
+  real_sqlite="$(command -v sqlite3)"
+  agmsg_sqlite() {
+    local input rewritten rc
+    case " $* " in
+    *' -batch '*)
+      input="$BATS_TEST_TMPDIR/commit.input"; rewritten="$BATS_TEST_TMPDIR/commit.rewritten"
+      cat >"$input"
+      if grep -q 'CREATE TEMP TABLE _ack_expected' "$input"; then
+        sed 's/^COMMIT;$/ROLLBACK;\nSELECT no_such_commit_boundary_function();/' "$input" >"$rewritten"
+        "$real_sqlite" "$@" <"$rewritten"; rc=$?; return "$rc"
+      fi
+      "$real_sqlite" "$@" <"$input"; rc=$?; return "$rc"
+      ;;
+    esac
+    "$real_sqlite" "$@"
+  }
+  assert_zero_stdout_failure commit-fault storage_ack_receipt receipts bob --receipt "$token"
+  unset -f agmsg_sqlite
+  [ "$(durable_state)" = "$before" ]
+  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';")" = 0 ]
 }
 
 @test "Task 4 process death after commit is reconciled by the exact retry" {
