@@ -461,6 +461,75 @@ assert_bounded_stderr() {
   [ "$after" = "$before" ]
 }
 
+@test "record policy covers missing and initialized summary result and error records" {
+  export AGMSG_BOUNDED_MAX_RECORD_BYTES=1
+  local before after out="$TEST_SKILL_DIR/small-cap.stdout" err="$TEST_SKILL_DIR/small-cap.stderr"
+
+  remove_store
+  before="$(store_fingerprint)"
+  if storage_unread_summary agsuite bob >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  : > "$err"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 1 >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+
+  reset_bounded_store
+  before="$(store_fingerprint)"
+  : > "$err"
+  if storage_unread_summary agsuite bob >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  : > "$err"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 1 >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+
+  append_fixture_message small-cap-error xx '2026-01-01T00:00:00Z'
+  before="$(store_fingerprint)"
+  : > "$err"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 1 >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  : > "$err"
+  if storage_get_message_bounded agsuite bob small-cap-error --max-body-bytes 1 >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "exact show measures the public record at 8192 and rejects 8193" {
+  export AGMSG_BOUNDED_MAX_RECORD_BYTES=8192
+  local id before after out="$TEST_SKILL_DIR/show-record.stdout" err="$TEST_SKILL_DIR/show-record.stderr" bytes
+
+  id="$(opaque_id_for_record_bytes 8192)"
+  append_fixture_message "$id" x '2026-01-01T00:00:00Z'
+  before="$(store_fingerprint)"
+  storage_get_message_bounded agsuite bob "$id" --max-body-bytes 1 >"$out" 2>"$err"
+  [ ! -s "$err" ]
+  bytes="$(sed -n '1p' "$out" | wc -c | tr -d ' ')"
+  [ "$bytes" -eq 8193 ]
+  [ "$(sed -n '1p' "$out" | jq -r '.id')" = "$id" ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+
+  reset_bounded_store
+  id="$(opaque_id_for_record_bytes 8193)"
+  append_fixture_message "$id" x '2026-01-01T00:00:00Z'
+  before="$(store_fingerprint)"
+  if storage_get_message_bounded agsuite bob "$id" --max-body-bytes 1 >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
 @test "bounded public output failures return non-zero without durable mutation" {
   local id before after out="$TEST_SKILL_DIR/output.stdout" err="$TEST_SKILL_DIR/output.stderr"
   id="$(storage_send agsuite alice bob output-failure)"
@@ -471,7 +540,7 @@ assert_bounded_stderr() {
   printf() {
     if [ "$1" = '%s\n' ]; then
       case "${FUNCNAME[1]:-}" in
-        _sqlite_bounded_public_result|_jsonl_bounded_emit|storage_get_message_bounded)
+        _agmsg_bounded_emit_records|_sqlite_bounded_public_result|_jsonl_bounded_emit|storage_get_message_bounded)
           return 1
           ;;
       esac

@@ -640,10 +640,7 @@ _sqlite_bounded_public_result() {
     "{\"type\":\"__agmsg_bounded_status\",\"status\":\"$expected\"}")
       rest="$(printf '%s\n' "$output" | tail -n +2)"
       [ -n "$rest" ] || { printf 'storage: bounded read returned no record\n' >&2; return 13; }
-      if ! printf '%s\n' "$rest"; then
-        printf 'storage: bounded read output write failed\n' >&2
-        return 13
-      fi
+      _agmsg_bounded_emit_records "$rest" || return 13
       [ "$on_overflow" -eq 1 ] && return 13
       return 0
       ;;
@@ -656,11 +653,8 @@ storage_unread_summary() {
   _agmsg_bounded_parse_args || return 13
   db="$(_sqlite_db "$team")" || return 13
   if [ ! -e "$db" ] && [ ! -L "$db" ]; then
-    if ! printf '%s\n' '{"type":"unread_summary","unread_count":0,"newest_id":null}'; then
-      printf 'storage: bounded summary output write failed\n' >&2
-      return 13
-    fi
-    return 0
+    _agmsg_bounded_emit_records '{"type":"unread_summary","unread_count":0,"newest_id":null}'
+    return $?
   fi
   if [ ! -f "$db" ] || [ ! -r "$db" ]; then
     printf 'storage: SQLite store is not a readable regular file\n' >&2
@@ -676,11 +670,8 @@ storage_list_unread_bounded() {
   _agmsg_bounded_parse_args "$@" || return 13
   db="$(_sqlite_db "$team")" || return 13
   if [ ! -e "$db" ] && [ ! -L "$db" ]; then
-    if ! printf '%s\n' "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"; then
-      printf 'storage: bounded list output write failed\n' >&2
-      return 13
-    fi
-    return 0
+    _agmsg_bounded_emit_records "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"
+    return $?
   fi
   if [ ! -f "$db" ] || [ ! -r "$db" ]; then
     printf 'storage: SQLite store is not a readable regular file\n' >&2
@@ -714,18 +705,12 @@ storage_get_message_bounded() {
     '{"type":"__agmsg_bounded_status","status":"ok"}')
       rest="$(printf '%s\n' "$output" | tail -n +2)"
       [ -n "$rest" ] || { printf 'storage: bounded show returned no record\n' >&2; return 13; }
-      if ! printf '%s\n' "$rest"; then
-        printf 'storage: bounded show output write failed\n' >&2
-        return 13
-      fi
+      _agmsg_bounded_emit_records "$rest" || return 13
       ;;
     '{"type":"__agmsg_bounded_status","status":"overflow"}')
       rest="$(printf '%s\n' "$output" | tail -n +2)"
       [ -n "$rest" ] || { printf 'storage: bounded show overflow missing metadata\n' >&2; return 13; }
-      if ! printf '%s\n' "$rest"; then
-        printf 'storage: bounded show output write failed\n' >&2
-        return 13
-      fi
+      _agmsg_bounded_emit_records "$rest" || return 13
       return 13
       ;;
     *) printf 'storage: message not found or malformed\n' >&2; return 13 ;;

@@ -460,6 +460,40 @@ _agmsg_bounded_parse_args() {
   done
 }
 
+# Validate every completed public JSON record before a single final write.
+# Records are compact JSONL, so a literal newline is the record separator and
+# is not part of the per-record UTF-8 byte limit.
+_agmsg_bounded_emit_records() {
+  local records="$1" rest record bytes last=0
+  [ -n "$records" ] || {
+    printf 'storage: bounded read returned no record\n' >&2
+    return 13
+  }
+  rest="$records"
+  while :; do
+    case "$rest" in
+      *$'\n'*)
+        record="${rest%%$'\n'*}"
+        rest="${rest#*$'\n'}"
+        ;;
+      *)
+        record="$rest"
+        last=1
+        ;;
+    esac
+    bytes="$(LC_ALL=C printf '%s' "$record" | wc -c | tr -d '[:space:]')" || return 13
+    [ "$bytes" -le "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" ] 2>/dev/null || {
+      printf 'storage: bounded record exceeds output policy\n' >&2
+      return 13
+    }
+    [ "$last" -eq 0 ] || break
+  done
+  if ! printf '%s\n' "$records"; then
+    printf 'storage: bounded read output write failed\n' >&2
+    return 13
+  fi
+}
+
 _agmsg_bounded_parse_show_args() {
   local option
   for option in "$@"; do

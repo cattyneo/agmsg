@@ -419,10 +419,7 @@ _jsonl_bounded_render_list() {
 }
 
 _jsonl_bounded_emit() {
-  if ! printf '%s\n' "$1"; then
-    printf 'storage: bounded read output write failed\n' >&2
-    return 13
-  fi
+  _agmsg_bounded_emit_records "$1"
 }
 
 storage_unread_summary() {
@@ -499,7 +496,8 @@ storage_get_message_bounded() {
   rendered="$(printf '%s\n' "$snapshot" | jq -c -s --arg id "$message_id" --argjson max_bytes "$_AGMSG_BOUNDED_MAX_BODY_BYTES" --argjson max_record "$_AGMSG_BOUNDED_MAX_RECORD_BYTES" '
     map(select(.id==$id)) as $matches |
     if ($matches|length) != 1 then {status:"invalid",out:[]}
-    else ($matches[0] + {body_bytes:($matches[0].body|utf8bytelength)}) as $row |
+    else ($matches[0] | del(.delivery_ord)) as $public |
+      ($public + {body_bytes:($public.body|utf8bytelength)}) as $row |
       if $row.body_bytes > $max_bytes then
         ({type:"bounded_message_error",reason:"body_too_large",
           id:$row.id,body_bytes:$row.body_bytes,max_body_bytes:$max_bytes}) as $error |
@@ -507,9 +505,9 @@ storage_get_message_bounded() {
         then {status:"invalid",out:[]}
         else {status:"overflow",out:[$error]}
         end
-      elif (($matches[0]|tojson|utf8bytelength) > $max_record)
+      elif (($public|tojson|utf8bytelength) > $max_record)
       then {status:"invalid",out:[]}
-      else {status:"ok",out:[$matches[0] | del(.delivery_ord)]}
+      else {status:"ok",out:[$public]}
       end
     end
   ')" || return 13
