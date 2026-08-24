@@ -139,6 +139,59 @@ data stream (a designated final line), not a status.
 writes only its `key=value` registry metadata to stdout — never a §1.4 status
 name, which a metadata consumer would otherwise misread.
 
+#### 2.1.1 Bounded read-only operations (fork order 2b phase 1)
+
+The bundled drivers additionally expose the following lower-level read surface:
+
+```
+storage_unread_summary <team> <agent>
+storage_list_unread_bounded <team> <agent> [--limit-items N] [--max-body-bytes N]
+storage_get_message_bounded <team> <agent> <opaque-id> [--max-body-bytes N]
+```
+
+These operations are read-only observations. A missing store returns an empty
+summary or bounded-list result without creating a file, schema, migration
+marker, cursor, lock, event, receipt, claim, key, or other durable state. A
+present but unreadable store fails non-zero; it is never treated as empty. Each
+operation reads one consistent snapshot and validates the complete candidate
+set before emitting any public stdout.
+
+`storage_unread_summary` emits one JSON record:
+
+```json
+{"type":"unread_summary","unread_count":2,"newest_id":"..."}
+```
+
+`newest_id` is `null` for an empty set. Bodies are not part of this record.
+
+`storage_list_unread_bounded` emits a consecutive prefix of unread
+`message_sent` records in delivery order, followed by:
+
+```json
+{"type":"bounded_unread_result","selected_count":1,"selected_body_bytes":4,"remaining_count":2,"remaining_body_bytes":9,"limit_items":10,"max_body_bytes":4096}
+```
+
+The defaults are `limit_items=10` and `max_body_bytes=4096`; accepted values
+are `0..10` and `0..4096`. Body limits count raw UTF-8 bytes and a body is
+always emitted whole or not at all. If the first candidate body exceeds the
+bound, the operation emits only bounded metadata (without `body`) with
+`type=bounded_unread_error` and `reason=body_too_large`, then exits non-zero.
+A later candidate that does not fit remains in the reported remaining count and
+byte total. Invalid bounds, malformed envelopes, ambiguous rows, and driver
+failures emit no public stdout and exit non-zero.
+
+`storage_get_message_bounded` returns one unread `message_sent` row addressed
+to the supplied agent and matching the opaque stored ID, when its complete body
+fits the requested bound. It is recipient-scoped and does not mark the row read
+or advance a cursor; inspecting a later row is never an acknowledgement
+candidate. An oversized match emits only `bounded_message_error` metadata and
+exits non-zero. IDs remain byte-for-byte opaque strings here: this operation
+does not define transport encoding, shell quoting, or a new ID maximum.
+
+Public CLI framing, receipt issuance/crypto/expiry/replay/nonce, ack atomicity,
+JSONL crash recovery or old-reader migration, and precedence with `#373` remain
+separate decisions and are not part of these driver functions.
+
 ### 2.2 Delivery cursor (watch / replay)
 
 Live delivery (`watch.sh`, `check-inbox.sh`, and `inbox.sh`) resumes from the

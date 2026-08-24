@@ -1,0 +1,312 @@
+#!/usr/bin/env bats
+
+# Driver-agnostic tests for the phase-1 bounded read-only storage facade.
+# The public CLI, ID transport grammar, receipts/ack, JSONL recovery, and claim
+# precedence are deliberately not exercised here; those are later contracts.
+
+load test_helper
+
+setup() {
+  setup_test_env
+  export SKILL_DIR="$TEST_SKILL_DIR"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/storage.sh"
+  agmsg_storage_load
+  storage_init agsuite >/dev/null
+}
+
+teardown() { teardown_test_env; }
+
+store_dir() { dirname "$(agmsg_db_path agsuite)"; }
+
+remove_store() {
+  local dir; dir="$(store_dir)"
+  case "${AGMSG_STORAGE_DRIVER:-sqlite}" in
+    jsonl)
+      rm -f "$dir/events.jsonl" "$dir/events.jsonl.lock" \
+        "$dir/.read-cursor-v1" "$dir/.read-cursor-v1.lock" \
+        "$dir/read-cursors.tsv" "$dir"/read-cursors.tsv.tmp.*
+      ;;
+    *)
+      rm -f "$dir/messages.db" "$dir/messages.db-wal" "$dir/messages.db-shm"
+      ;;
+  esac
+}
+
+store_fingerprint() {
+  # SQLite's WAL shared-memory index is refreshed by a read transaction; it is
+  # an ephemeral lock/index artifact, not durable message/read state.
+  find "$(store_dir)" -type f ! -name 'messages.db-shm' -exec shasum {} \; 2>/dev/null | LC_ALL=C sort
+}
+
+json_count() {
+  printf '%s\n' "$1" | jq -s '[.[] | select(.type == "message_sent")] | length'
+}
+
+json_result() {
+  printf '%s\n' "$1" | tail -1 | jq -e 'select(.type == "bounded_unread_result")'
+}
+
+@test "bounded summary observes a missing store without creating it" {
+  remove_store
+  local before after
+  before="$(store_fingerprint)"
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = unread_summary ]
+  [ "$(printf '%s' "$output" | jq -r '.unread_count')" = 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.newest_id')" = null ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "bounded summary returns count/newest id without a body field" {
+  local first second
+  first=$(storage_send agsuite alice bob first-summary)
+  second=$(storage_send agsuite alice bob second-summary)
+  storage_send agsuite alice carol other-summary >/dev/null
+  local before after
+  before="$(store_fingerprint)"
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = unread_summary ]
+  [ "$(printf '%s' "$output" | jq -r '.unread_count')" = 2 ]
+  [ "$(printf '%s' "$output" | jq -r '.newest_id')" = "$second" ]
+  [ "$(printf '%s' "$output" | jq -e 'has("body") | not')" = true ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+  [ -n "$first" ]
+}
+
+@test "bounded list and exact show observe a missing store without creating it" {
+  remove_store
+  local before after out="$TEST_SKILL_DIR/missing-show.stdout"
+  before="$(store_fingerprint)"
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = bounded_unread_result ]
+  [ "$(printf '%s' "$output" | jq -r '.remaining_count')" = 0 ]
+  if storage_get_message_bounded agsuite bob missing --max-body-bytes 4096 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "bounded summary and list return explicit empty records for an initialized empty store" {
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.unread_count')" = 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.newest_id')" = null ]
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = bounded_unread_result ]
+  [ "$(printf '%s' "$output" | jq -r '.selected_count')" = 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.remaining_count')" = 0 ]
+}
+
+@test "bounded list honors item limits 0, 1, and 10 and emits counts/bytes" {
+  local i
+  for i in $(seq 1 10); do storage_send agsuite alice bob "m$i" >/dev/null; done
+
+  run storage_list_unread_bounded agsuite bob --limit-items 0 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(json_count "$output")" = 0 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.selected_count')" = 0 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.remaining_count')" = 10 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.remaining_body_bytes')" = 21 ]
+
+  run storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(json_count "$output")" = 1 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.selected_count')" = 1 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.remaining_count')" = 9 ]
+
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(json_count "$output")" = 10 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.selected_count')" = 10 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.remaining_count')" = 0 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.selected_body_bytes')" = 21 ]
+}
+
+@test "bounded list uses raw UTF-8 body bytes and never truncates" {
+  storage_send agsuite alice bob あ >/dev/null
+  local body; body="$(printf 'line1\nline2\t\001')"
+  local id; id=$(storage_send agsuite alice bob "$body")
+
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 3
+  [ "$status" -eq 0 ]
+  [ "$(json_count "$output")" = 1 ]
+  [ "$(printf '%s' "$output" | head -1 | jq -r '.body')" = あ ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.remaining_count')" = 1 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.remaining_body_bytes')" = 13 ]
+
+  run storage_get_message_bounded agsuite bob "$id" --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = message_sent ]
+  [ "$(printf '%s' "$output" | jq -r '.id')" = "$id" ]
+  [ "$(printf '%s' "$output" | jq -r '.body')" = "$body" ]
+}
+
+@test "bounded list accepts an empty body at a zero-byte bound" {
+  storage_send agsuite alice bob '' >/dev/null
+  run storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 0
+  [ "$status" -eq 0 ]
+  [ "$(json_count "$output")" = 1 ]
+  [ "$(printf '%s' "$output" | head -1 | jq -r '.body')" = '' ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.selected_body_bytes')" = 0 ]
+}
+
+@test "bounded list reaches the one-byte and 4096-byte body boundaries" {
+  local one; one=$(storage_send agsuite alice bob x)
+  run storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 1
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.selected_body_bytes')" = 1 ]
+  storage_mark_read_batch agsuite bob "$one" >/dev/null
+
+  local body; body="$(printf '%4096s' x | tr ' ' x)"
+  storage_send agsuite alice bob "$body" >/dev/null
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.selected_body_bytes')" = 4096 ]
+  [ "$(printf '%s' "$output" | tail -1 | jq -r '.remaining_body_bytes')" = 0 ]
+}
+
+@test "bounded list reports a first-row body overflow without leaking its body" {
+  local body; body="$(printf '%4097s' x | tr ' ' x)"
+  storage_send agsuite alice bob "$body" >/dev/null
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -ne 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = bounded_unread_error ]
+  [ "$(printf '%s' "$output" | jq -r '.reason')" = body_too_large ]
+  [ "$(printf '%s' "$output" | jq -r '.body_bytes')" = 4097 ]
+  [ "$(printf '%s' "$output" | jq -e 'has("body") | not')" = true ]
+  [[ "$output" != *"xxxxxxxxxxxxxxxxxxxxxxxx"* ]]
+}
+
+@test "bounded list rejects unsafe bounds with zero stdout" {
+  storage_send agsuite alice bob bound-check >/dev/null
+  local out="$TEST_SKILL_DIR/bounds.stdout"
+  if storage_list_unread_bounded agsuite bob --limit-items 11 --max-body-bytes 4096 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes -1 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+}
+
+@test "exact show can inspect a later unread row without changing the store" {
+  local first later
+  first=$(storage_send agsuite alice bob first-row)
+  later=$(storage_send agsuite alice bob later-row)
+  local before after
+  before="$(store_fingerprint)"
+  run storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 9
+  [ "$status" -eq 0 ]
+  [ "$(json_count "$output")" = 1 ]
+  [ "$(printf '%s' "$output" | head -1 | jq -r '.id')" = "$first" ]
+  run storage_get_message_bounded agsuite bob "$later" --max-body-bytes 9
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.id')" = "$later" ]
+  [ "$(printf '%s' "$output" | jq -r '.body')" = later-row ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "exact show is recipient-scoped and overflow is metadata-only" {
+  local id; id=$(storage_send agsuite alice bob scoped-row)
+  local out="$TEST_SKILL_DIR/show.stdout"
+  if storage_get_message_bounded agsuite carol "$id" --max-body-bytes 4096 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+  if storage_get_message_bounded agsuite bob "$id" --limit-items 1 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+
+  local body; body="$(printf '%4097s' x | tr ' ' x)"
+  local large; large=$(storage_send agsuite alice bob "$body")
+  run storage_get_message_bounded agsuite bob "$large" --max-body-bytes 4096
+  [ "$status" -ne 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = bounded_message_error ]
+  [ "$(printf '%s' "$output" | jq -e 'has("body") | not')" = true ]
+  [[ "$output" != *"xxxxxxxxxxxxxxxxxxxxxxxx"* ]]
+}
+
+@test "bounded read failures do not print partial output" {
+  remove_store
+  printf 'not a store\n' > "$(store_dir)/messages.db"
+  if [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ]; then
+    printf 'not a store\n' > "$(store_dir)/events.jsonl"
+  fi
+  local out="$TEST_SKILL_DIR/failure.stdout"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 4096 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+  if storage_get_message_bounded agsuite bob unknown --max-body-bytes 4096 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+}
+
+@test "sqlite bounded reads preserve an opaque event id and a legacy decimal id" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific IDs"
+  local db; db="$(agmsg_db_path agsuite)"
+  agmsg_sqlite "$db" "INSERT INTO events(type,id,team,from_agent,to_agent,body,at)
+    VALUES('message_sent','opaque/id.v1','agsuite','alice','bob','opaque-body','2026-01-01T00:00:00Z');
+    INSERT INTO messages(team,from_agent,to_agent,body,created_at)
+    VALUES('agsuite','alice','bob','legacy-body','2026-01-01T00:00:01Z');" >/dev/null
+  run storage_get_message_bounded agsuite bob opaque/id.v1 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.id')" = opaque/id.v1 ]
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [[ "$output" == *legacy-body* ]]
+  [[ "$output" == *'"id":"opaque/id.v1"'* ]]
+}
+
+@test "sqlite malformed candidate metadata fails before stdout" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific envelope"
+  local db; db="$(agmsg_db_path agsuite)"
+  agmsg_sqlite "$db" "INSERT INTO events(type,id,team,from_agent,to_agent,body,at)
+    VALUES('message_sent','bad-meta','agsuite',NULL,'bob','body','2026-01-01T00:00:00Z');" >/dev/null
+  local out="$TEST_SKILL_DIR/malformed.stdout"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 4096 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+}
+
+@test "jsonl malformed candidate metadata fails before stdout" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific envelope"
+  local log; log="$(store_dir)/events.jsonl"
+  printf '%s\n' '{"type":"message_sent","id":"bad","team":"agsuite","from":"alice","to":"bob","body":null,"at":"2026-01-01T00:00:00Z"}' >> "$log"
+  local out="$TEST_SKILL_DIR/malformed.stdout"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 4096 >"$out" 2>/dev/null; then
+    false
+  fi
+  [ ! -s "$out" ]
+}
+
+@test "jsonl bounded reads project an imported logical message without mutation" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific nested event"
+  local log; log="$(store_dir)/events.jsonl"
+  printf '%s\n' '{"type":"sync_pull_commit","messages":[{"status":"imported","local_event":{"type":"message_sent","id":"opaque/nested","team":"agsuite","from":"alice","to":"bob","body":"nested-body","at":"2026-01-01T00:00:00Z"}}]}' >> "$log"
+  local before after
+  before="$(store_fingerprint)"
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.unread_count')" = 1 ]
+  [ "$(printf '%s' "$output" | jq -r '.newest_id')" = opaque/nested ]
+  run storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | head -1 | jq -r '.id')" = opaque/nested ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}

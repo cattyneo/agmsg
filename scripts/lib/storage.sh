@@ -374,6 +374,74 @@ agmsg_sqlesc() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
 
+# Parse the bounded read options shared by the bundled drivers. The bounds are
+# intentionally finite at this lower layer: a later public CLI may choose a
+# smaller policy, but it must not turn a preview into an unbounded body read.
+# Keep this Bash 3.2-compatible and independent of jq so the sqlite driver does
+# not acquire the JSONL driver's optional dependency.
+_agmsg_decimal_normalize() {
+  local value="$1"
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  while [ "${value#0}" != "$value" ]; do value="${value#0}"; done
+  [ -n "$value" ] || value=0
+  printf '%s\n' "$value"
+}
+
+_agmsg_bounded_parse_args() {
+  _AGMSG_BOUNDED_LIMIT=10
+  _AGMSG_BOUNDED_MAX_BODY_BYTES=4096
+  local value normalized
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit-items)
+        [ $# -ge 2 ] || { printf 'storage: --limit-items requires a value\n' >&2; return 13; }
+        value="$2"; shift 2
+        normalized="$(_agmsg_decimal_normalize "$value")" || {
+          printf 'storage: invalid --limit-items\n' >&2; return 13;
+        }
+        case "$normalized" in
+          0|1|2|3|4|5|6|7|8|9|10) _AGMSG_BOUNDED_LIMIT="$normalized" ;;
+          *) printf 'storage: --limit-items must be between 0 and 10\n' >&2; return 13 ;;
+        esac
+        ;;
+      --max-body-bytes)
+        [ $# -ge 2 ] || { printf 'storage: --max-body-bytes requires a value\n' >&2; return 13; }
+        value="$2"; shift 2
+        normalized="$(_agmsg_decimal_normalize "$value")" || {
+          printf 'storage: invalid --max-body-bytes\n' >&2; return 13;
+        }
+        # Strip leading zeroes before the length/numeric check, so a large
+        # textual token cannot overflow shell arithmetic.
+        case "${#normalized}" in
+          1|2|3) _AGMSG_BOUNDED_MAX_BODY_BYTES="$normalized" ;;
+          4)
+            [ "$normalized" -le 4096 ] 2>/dev/null || {
+              printf 'storage: --max-body-bytes must be between 0 and 4096\n' >&2; return 13;
+            }
+            _AGMSG_BOUNDED_MAX_BODY_BYTES="$normalized"
+            ;;
+          *) printf 'storage: --max-body-bytes must be between 0 and 4096\n' >&2; return 13 ;;
+        esac
+        ;;
+      *)
+        printf 'storage: unknown bounded read option\n' >&2
+        return 13
+        ;;
+    esac
+  done
+}
+
+_agmsg_bounded_parse_show_args() {
+  local option
+  for option in "$@"; do
+    [ "$option" != "--limit-items" ] || {
+      printf 'storage: --limit-items is not valid for exact show\n' >&2
+      return 13
+    }
+  done
+  _agmsg_bounded_parse_args "$@"
+}
+
 # ── Storage driver facade (storage axis) ─────────────────────────────────────
 # The helpers above resolve the legacy sqlite path and run raw SQL; call sites
 # keep using them until #206 migrates them onto the contract below. The facade

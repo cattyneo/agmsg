@@ -102,7 +102,9 @@ existing storage driver facade.
 **Steps:**
 
 1. Add read-only helpers that inspect the existing log and cursor file without
-   `_jsonl_init_file`, migration, lock creation, or other durable writes.
+   `_jsonl_init_file`, migration, or durable writes. Reuse the existing transient
+   read lock only to make the log/cursor snapshot consistent with concurrent
+   writers.
 2. Project flat and imported `sync_pull_commit` logical events in one jq
    snapshot, preserving delivery order and the existing logical cursor/read
    exception semantics.

@@ -228,6 +228,198 @@ _jsonl_prepare_rotated_generation_locked() {
   "$node" "$helper" rotate-generation "$target" >/dev/null
 }
 
+# --- bounded read-only facade (#203 fork phase 1) --------------------------
+# Do not use _jsonl_init_file here: it creates the log and may write the
+# read-cursor migration marker. A bounded read observes an existing log only;
+# the single jq -s invocation is the operation's read snapshot.
+
+_jsonl_bounded_cursor_ro() {
+  local team="$1" agent="$2" f value normalized
+  f="$(_jsonl_read_cursors)"
+  [ -f "$f" ] || { printf '0\n'; return 0; }
+  value="$(awk -F '\t' -v t="$team" -v a="$agent" '$1==t && $2==a {p=$3}
+    END { print (p=="" ? 0 : p) }' "$f")" || return 1
+  normalized="$(_agmsg_decimal_normalize "$value")" || return 1
+  printf '%s\n' "$normalized"
+}
+
+_jsonl_bounded_rows_snapshot() {
+  local team="$1" agent="$2" cursor="$3" log="$4"
+  jq -c --arg team "$team" --arg agent "$agent" --argjson cursor "$cursor" -s '
+    def logical_events: .[] |
+      if .type=="sync_pull_commit" then
+        .messages[]? | select(.status=="imported") | .local_event // empty
+      else . end;
+    [logical_events] as $events |
+    (reduce $events[] as $e ({};
+      if ($e|type)=="object" and $e.type=="message_read"
+         and $e.team==$team and $e.agent==$agent
+      then .[$e.msg_id]=true else . end)) as $read |
+    [$events | to_entries[]
+      | select((.key + 1) > $cursor
+          and (.value|type)=="object"
+          and .value.type=="message_sent"
+          and .value.team==$team and .value.to==$agent
+          and (($read[.value.id] // false) | not))
+      | .value
+      | {type:"message_sent",id:.id,team:.team,from:.from,to:.to,body:.body,at:.at}]
+    as $rows |
+    if all($rows[];
+      (.id|type)=="string" and (.team|type)=="string"
+      and (.from|type)=="string" and (.to|type)=="string"
+      and (.body|type)=="string" and (.at|type)=="string")
+    then $rows[]
+    else error("invalid bounded message envelope")
+    end
+  ' "$log"
+}
+
+_jsonl_bounded_summary_snapshot() {
+  local team="$1" agent="$2" cursor="$3" log="$4"
+  jq -c --arg team "$team" --arg agent "$agent" --argjson cursor "$cursor" -s '
+    def logical_events: .[] |
+      if .type=="sync_pull_commit" then
+        .messages[]? | select(.status=="imported") | .local_event // empty
+      else . end;
+    [logical_events] as $events |
+    (reduce $events[] as $e ({};
+      if ($e|type)=="object" and $e.type=="message_read"
+         and $e.team==$team and $e.agent==$agent
+      then .[$e.msg_id]=true else . end)) as $read |
+    [$events | to_entries[]
+      | select((.key + 1) > $cursor
+          and (.value|type)=="object"
+          and .value.type=="message_sent"
+          and .value.team==$team and .value.to==$agent
+          and (($read[.value.id] // false) | not))
+      | .value
+      | {id:.id,team:.team,from:.from,to:.to,at:.at,
+         body_type:(.body|type)}] as $rows |
+    if all($rows[];
+      (.id|type)=="string" and (.team|type)=="string"
+      and (.from|type)=="string" and (.to|type)=="string"
+      and .body_type=="string" and (.at|type)=="string")
+    then {type:"unread_summary",unread_count:($rows|length),
+          newest_id:(if ($rows|length)==0 then null else $rows[-1].id end)}
+    else error("invalid bounded message envelope")
+    end
+  ' "$log"
+}
+
+_jsonl_bounded_summary_locked() {
+  local team="$1" agent="$2" log cursor
+  log="$(_jsonl_log)" || return 1
+  [ -f "$log" ] || return 1
+  cursor="$(_jsonl_bounded_cursor_ro "$team" "$agent")" || return 1
+  _jsonl_bounded_summary_snapshot "$team" "$agent" "$cursor" "$log"
+}
+
+_jsonl_bounded_rows_locked() {
+  local team="$1" agent="$2" log cursor
+  log="$(_jsonl_log)" || return 1
+  [ -f "$log" ] || return 1
+  cursor="$(_jsonl_bounded_cursor_ro "$team" "$agent")" || return 1
+  _jsonl_bounded_rows_snapshot "$team" "$agent" "$cursor" "$log"
+}
+
+_jsonl_bounded_render_list() {
+  local limit="$1" max_bytes="$2"
+  jq -c -s --argjson limit "$limit" --argjson max_bytes "$max_bytes" '
+    map(. + {body_bytes:(.body|utf8bytelength)}) as $rows |
+    (reduce range(0; ($rows|length)) as $i
+      ({selected:[],selected_body_bytes:0,stop:false,oversize:null};
+       if .stop then .
+       elif (.selected|length) >= $limit then .stop=true
+       elif ($rows[$i].body_bytes > $max_bytes and (.selected|length)==0)
+         then .oversize=$rows[$i] | .stop=true
+       elif (.selected_body_bytes + $rows[$i].body_bytes <= $max_bytes)
+         then .selected += [$rows[$i]] |
+              .selected_body_bytes += $rows[$i].body_bytes
+       else .stop=true
+       end)) as $decision |
+    if $decision.oversize != null then
+      {status:"overflow",out:[($decision.oversize |
+        {type:"bounded_unread_error",reason:"body_too_large",id:.id,
+         body_bytes:.body_bytes,max_body_bytes:$max_bytes,
+         selected_count:0,selected_body_bytes:0,
+         remaining_count:($rows|length),
+         remaining_body_bytes:($rows|map(.body_bytes)|add // 0)})]}
+    else
+      ($decision.selected|length) as $selected_count |
+      ($decision.selected|map(.body_bytes)|add // 0) as $selected_bytes |
+      {status:"ok",out:(
+        ($decision.selected|map(del(.body_bytes))) +
+        [{type:"bounded_unread_result",selected_count:$selected_count,
+          selected_body_bytes:$selected_bytes,
+          remaining_count:(($rows|length)-$selected_count),
+          remaining_body_bytes:(($rows|map(.body_bytes)|add // 0)-$selected_bytes),
+          limit_items:$limit,max_body_bytes:$max_bytes}])}
+    end
+  '
+}
+
+storage_unread_summary() {
+  _JSONL_TEAM="$1"
+  local team="$1" agent="$2" log cursor output
+  log="$(_jsonl_log)" || return 13
+  if [ ! -f "$log" ]; then
+    printf '%s\n' '{"type":"unread_summary","unread_count":0,"newest_id":null}'
+    return 0
+  fi
+  output="$(_jsonl_with_lock _jsonl_bounded_summary_locked "$team" "$agent")" || return 13
+  printf '%s\n' "$output"
+}
+
+storage_list_unread_bounded() {
+  _JSONL_TEAM="$1"
+  local team="$1" agent="$2" log snapshot rendered status
+  shift 2
+  _agmsg_bounded_parse_args "$@" || return 13
+  log="$(_jsonl_log)" || return 13
+  if [ ! -f "$log" ]; then
+    printf '%s\n' "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"
+    return 0
+  fi
+  snapshot="$(_jsonl_with_lock _jsonl_bounded_rows_locked "$team" "$agent")" || return 13
+  rendered="$(printf '%s\n' "$snapshot" | _jsonl_bounded_render_list "$_AGMSG_BOUNDED_LIMIT" "$_AGMSG_BOUNDED_MAX_BODY_BYTES")" || return 13
+  status="$(printf '%s\n' "$rendered" | jq -r '.status')" || return 13
+  case "$status" in
+    ok|overflow)
+      printf '%s\n' "$rendered" | jq -c '.out[]' || return 13
+      [ "$status" = overflow ] && return 13
+      return 0
+      ;;
+    *) return 13 ;;
+  esac
+}
+
+storage_get_message_bounded() {
+  _JSONL_TEAM="$1"
+  local team="$1" agent="$2" message_id="$3" log snapshot rendered
+  shift 3
+  [ -n "$message_id" ] || { printf 'storage: message id is required\n' >&2; return 13; }
+  _agmsg_bounded_parse_show_args "$@" || return 13
+  log="$(_jsonl_log)" || return 13
+  [ -f "$log" ] || { printf 'storage: message not found\n' >&2; return 13; }
+  snapshot="$(_jsonl_with_lock _jsonl_bounded_rows_locked "$team" "$agent")" || return 13
+  rendered="$(printf '%s\n' "$snapshot" | jq -c -s --arg id "$message_id" --argjson max_bytes "$_AGMSG_BOUNDED_MAX_BODY_BYTES" '
+    map(select(.id==$id)) as $matches |
+    if ($matches|length) != 1 then {status:"invalid",out:[]}
+    else ($matches[0] + {body_bytes:($matches[0].body|utf8bytelength)}) as $row |
+      if $row.body_bytes > $max_bytes then
+        {status:"overflow",out:[{type:"bounded_message_error",reason:"body_too_large",
+          id:$row.id,body_bytes:$row.body_bytes,max_body_bytes:$max_bytes}]}
+      else {status:"ok",out:[$matches[0]]}
+      end
+    end
+  ')" || return 13
+  case "$(printf '%s\n' "$rendered" | jq -r '.status')" in
+    ok) printf '%s\n' "$rendered" | jq -c '.out[]' || return 13 ;;
+    overflow) printf '%s\n' "$rendered" | jq -c '.out[]' || return 13; return 13 ;;
+    *) printf 'storage: message not found or malformed\n' >&2; return 13 ;;
+  esac
+}
+
 storage_list_unread() {
   _JSONL_TEAM="$1"
   _jsonl_init_file || return 1
