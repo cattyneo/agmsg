@@ -542,12 +542,211 @@ SH
   [ "$after" = "$before" ]
 }
 
-# Task 4 remains intentionally RED until its own TDD cycle; Task 3 runs use
-# `--negative-filter 'Task 4'` so issuance cannot be made green by a placeholder.
-@test "Task 4 acknowledgement remains RED only because the ack operation is missing" {
+ack_abi_required() {
   declare -F storage_ack_receipt >/dev/null || {
     printf 'missing optional receipt acknowledgement function: storage_ack_receipt\n' >&2
     return 1
   }
-  storage_ack_receipt receipts bob --receipt not-a-token
+}
+
+issue_list_token() {
+  storage_list_unread_bounded receipts "$1" --limit-items "${2:-10}" \
+    --max-body-bytes 4096 --issue-receipt | receipt_token
+}
+
+base64url_encode_file() {
+  openssl base64 -A -in "$1" | tr '+/' '-_' | tr -d '='
+}
+
+resign_receipt_field() {
+  local token="$1" field="$2" value="$3" payload_part signature_part
+  payload_part="${token%%.*}"; signature_part="${token#*.}"
+  base64url_decode_to "$payload_part" "$BATS_TEST_TMPDIR/resign.in"
+  awk -F= -v field="$field" -v value="$value" \
+    '$1 == field {$0=field "=" value} {print}' "$BATS_TEST_TMPDIR/resign.in" \
+    >"$BATS_TEST_TMPDIR/resign.payload"
+  openssl pkeyutl -sign -rawin -inkey "$(receipt_private_key)" \
+    -in "$BATS_TEST_TMPDIR/resign.payload" -out "$BATS_TEST_TMPDIR/resign.sig"
+  printf '%s.%s\n' \
+    "$(base64url_encode_file "$BATS_TEST_TMPDIR/resign.payload")" \
+    "$(base64url_encode_file "$BATS_TEST_TMPDIR/resign.sig")"
+}
+
+resign_receipt_times() {
+  local token="$1" issued="$2" expires="$3" payload_part
+  payload_part="${token%%.*}"
+  base64url_decode_to "$payload_part" "$BATS_TEST_TMPDIR/resign.in"
+  awk -F= -v issued="$issued" -v expires="$expires" '
+    $1 == "issued_at" {$0="issued_at=" issued}
+    $1 == "expires_at" {$0="expires_at=" expires}
+    {print}
+  ' "$BATS_TEST_TMPDIR/resign.in" >"$BATS_TEST_TMPDIR/resign.payload"
+  openssl pkeyutl -sign -rawin -inkey "$(receipt_private_key)" \
+    -in "$BATS_TEST_TMPDIR/resign.payload" -out "$BATS_TEST_TMPDIR/resign.sig"
+  printf '%s.%s\n' \
+    "$(base64url_encode_file "$BATS_TEST_TMPDIR/resign.payload")" \
+    "$(base64url_encode_file "$BATS_TEST_TMPDIR/resign.sig")"
+}
+
+ack_failure_text() {
+  local name="$1" recipient="$2" token="$3"
+  ack_abi_required
+  assert_zero_stdout_failure "$name" storage_ack_receipt receipts "$recipient" --receipt "$token"
+  cat "$BATS_TEST_TMPDIR/$name.stderr"
+}
+
+@test "Task 4 commits one exact prefix and an exact retained retry is already_committed" {
+  ack_abi_required
+  sql_event ack-a alice bob first 2026-01-01T00:00:00Z
+  sql_event ack-b carol bob second 2026-01-01T00:00:01Z
+  local token frontier
+  token="$(issue_list_token bob)"
+  decode_receipt "$token"
+  frontier="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^issuance_frontier=//p')"
+  run storage_ack_receipt receipts bob --receipt "$token"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM receipt_nonces;")" = 1 ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM events WHERE type='message_read' AND team='receipts' AND agent='bob';")" = 2 ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT local_position FROM read_cursors WHERE team='receipts' AND agent='bob';")" = "$frontier" ]
+  [ "$(ack_failure_text retained-retry bob "$token")" = 'agmsg receipt: already_committed' ]
+}
+
+@test "Task 4 rejects malformed forged wrong-scope and sender-as-recipient tokens without mutation" {
+  ack_abi_required
+  sql_event scoped alice bob body 2026-01-01T00:00:00Z
+  local token before forged wrong_scope
+  token="$(issue_list_token bob)"; before="$(durable_state)"
+  [ "$(ack_failure_text malformed bob not-a-token)" = 'agmsg receipt: invalid receipt' ]
+  forged="${token%?}A"
+  [ "$(ack_failure_text forged bob "$forged")" = 'agmsg receipt: invalid receipt' ]
+  wrong_scope="$(resign_receipt_field "$token" recipient_hex "$(hex_of carol)")"
+  [ "$(ack_failure_text wrong-scope bob "$wrong_scope")" = 'agmsg receipt: receipt scope mismatch' ]
+  [ "$(ack_failure_text sender-recipient alice "$token")" = 'agmsg receipt: receipt scope mismatch' ]
+  [ "$(durable_state)" = "$before" ]
+}
+
+@test "Task 4 authenticates canonical lifetime key generation and store scope before writes" {
+  ack_abi_required
+  sql_event auth alice bob body 2026-01-01T00:00:00Z
+  local token now before changed
+  token="$(issue_list_token bob)"; now="$(date +%s)"; before="$(durable_state)"
+  changed="$(resign_receipt_times "$token" "$((now - 901))" "$((now - 1))")"
+  [ "$(ack_failure_text expired bob "$changed")" = 'agmsg receipt: receipt expired' ]
+  changed="$(resign_receipt_times "$token" "$((now + 1))" "$((now + 901))")"
+  [ "$(ack_failure_text future bob "$changed")" = 'agmsg receipt: receipt is not yet valid' ]
+  changed="$(resign_receipt_times "$token" "$now" "$((now + 901))")"
+  [ "$(ack_failure_text lifetime bob "$changed")" = 'agmsg receipt: invalid receipt' ]
+  changed="$(resign_receipt_field "$token" store_generation 11111111111111111111111111111111)"
+  [ "$(ack_failure_text generation bob "$changed")" = 'agmsg receipt: receipt store identity mismatch' ]
+  changed="$(resign_receipt_field "$token" key_sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+  [ "$(ack_failure_text key bob "$changed")" = 'agmsg receipt: receipt store identity mismatch' ]
+  [ "$(durable_state)" = "$before" ]
+}
+
+@test "Task 4 refuses late earlier rows prefix gaps and displayed row drift but permits later append" {
+  ack_abi_required
+  sql_event drift-a alice bob first 2026-01-01T00:00:01Z
+  local token before
+  token="$(issue_list_token bob 1)"; before="$(durable_state)"
+  sql_event later alice bob later 2026-01-01T00:00:02Z
+  run storage_ack_receipt receipts bob --receipt "$token"
+  [ "$status" -eq 0 ]
+
+  # A fresh recipient proves that a newly inserted earlier row changes the
+  # signed prefix instead of being hidden by a later unrelated append.
+  sql_event drift-b alice dave first 2026-01-01T00:00:01Z
+  token="$(issue_list_token dave 1)"
+  sql_event drift-earlier eve dave earlier 2026-01-01T00:00:00Z
+  [ "$(ack_failure_text earlier dave "$token")" = 'agmsg receipt: unread prefix changed' ]
+  sqlite3 "$(agmsg_db_path receipts)" "DELETE FROM events WHERE id='drift-earlier'; UPDATE events SET body='changed',from_agent='mallory',at='2026-01-01T00:00:09Z' WHERE id='drift-b';"
+  [ "$(ack_failure_text drift dave "$token")" = 'agmsg receipt: unread prefix changed' ]
+}
+
+@test "Task 4 mirrors exact direct legacy and event-linked rows without decimal id collision" {
+  ack_abi_required
+  local db token direct_id linked_id
+  db="$(agmsg_db_path receipts)"
+  sqlite3 "$db" "
+    INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES('receipts','legacy','bob','direct','2026-01-01T00:00:00Z');
+    INSERT INTO messages(team,from_agent,to_agent,body,created_at) VALUES('receipts','event','bob','linked','2026-01-01T00:00:01Z');
+    INSERT INTO events(type,id,team,from_agent,to_agent,body,at,legacy_id)
+      VALUES('message_sent','event-linked','receipts','event','bob','linked','2026-01-01T00:00:01Z',last_insert_rowid());"
+  direct_id="$(sqlite3 "$db" "SELECT id FROM messages WHERE body='direct';")"
+  linked_id="$(sqlite3 "$db" "SELECT id FROM messages WHERE body='linked';")"
+  token="$(issue_list_token bob)"
+  run storage_ack_receipt receipts bob --receipt "$token"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM messages WHERE id IN ($direct_id,$linked_id) AND read_at IS NOT NULL;")" = 2 ]
+  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='message_read' AND msg_id IN ('$direct_id','event-linked');")" = 2 ]
+  sqlite3 "$db" "INSERT INTO events(type,id,team,from_agent,to_agent,body,at) VALUES('message_sent','$direct_id','receipts','x','carol','collision','2026-01-01T00:00:00Z');"
+  token="$(issue_list_token carol)"
+  [ -n "$token" ]
+}
+
+@test "Task 4 claim markers and a busy writer fail closed without partial state" {
+  ack_abi_required
+  sql_event guarded alice bob body 2026-01-01T00:00:00Z
+  local token before locker_rc
+  token="$(issue_list_token bob)"; before="$(durable_state)"
+  sqlite3 "$(agmsg_db_path receipts)" 'CREATE TABLE claims(id INTEGER);'
+  [ "$(ack_failure_text claims bob "$token")" = 'agmsg receipt: message claim capability conflicts with receipt state' ]
+  sqlite3 "$(agmsg_db_path receipts)" 'DROP TABLE claims;'
+  sqlite3 "$(agmsg_db_path receipts)" 'PRAGMA journal_mode=DELETE;' >/dev/null
+  coproc LOCKER { sqlite3 "$(agmsg_db_path receipts)" 'BEGIN IMMEDIATE; SELECT 1; .shell sleep 6' >/dev/null 2>&1; }
+  sleep 0.2
+  assert_zero_stdout_failure busy storage_ack_receipt receipts bob --receipt "$token"
+  wait "$LOCKER_PID" || locker_rc=$?
+  [ "${locker_rc:-0}" -eq 0 ]
+  [ "$(durable_state)" = "$before" ]
+}
+
+@test "Task 4 same-token concurrency commits once in WAL and DELETE modes" {
+  ack_abi_required
+  local mode db token out1 out2 err1 err2 rc1 rc2
+  for mode in WAL DELETE; do
+    db="$(agmsg_db_path receipts)"
+    sqlite3 "$db" "PRAGMA journal_mode=$mode; DELETE FROM events WHERE type='message_read'; DELETE FROM read_cursors; DELETE FROM receipt_nonces;" >/dev/null
+    sqlite3 "$db" "DELETE FROM events WHERE type='message_sent';"
+    sql_event "concurrent-$mode" alice bob body 2026-01-01T00:00:00Z
+    token="$(issue_list_token bob)"
+    out1="$BATS_TEST_TMPDIR/$mode.1.out"; out2="$BATS_TEST_TMPDIR/$mode.2.out"
+    err1="$BATS_TEST_TMPDIR/$mode.1.err"; err2="$BATS_TEST_TMPDIR/$mode.2.err"
+    storage_ack_receipt receipts bob --receipt "$token" >"$out1" 2>"$err1" & local p1=$!
+    storage_ack_receipt receipts bob --receipt "$token" >"$out2" 2>"$err2" & local p2=$!
+    wait "$p1" || rc1=$?; wait "$p2" || rc2=$?
+    [ ! -s "$out1" ] && [ ! -s "$out2" ]
+    [ "$(( ${rc1:-0} == 0 ? 1 : 0 ))" -ne "$(( ${rc2:-0} == 0 ? 1 : 0 ))" ]
+    [ "$(cat "$err1" "$err2" | grep -c '^agmsg receipt: already_committed$')" = 1 ]
+    [ "$(sqlite3 "$db" 'SELECT COUNT(*) FROM receipt_nonces;')" = 1 ]
+    [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';")" = 1 ]
+    unset rc1 rc2
+  done
+}
+
+@test "Task 4 retained expiry retries reconcile and eligible old nonces prune only on success" {
+  ack_abi_required
+  sql_event retention alice bob body 2026-01-01T00:00:00Z
+  local token nonce now old
+  token="$(issue_list_token bob)"
+  run storage_ack_receipt receipts bob --receipt "$token"
+  [ "$status" -eq 0 ]
+  [ "$(ack_failure_text retained-expired bob "$token")" = 'agmsg receipt: already_committed' ]
+  now="$(date +%s)"; old=$((now - 86401))
+  sqlite3 "$(agmsg_db_path receipts)" "INSERT INTO receipt_nonces VALUES(
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',$old,$old);"
+  sql_event retention-next alice carol next 2026-01-01T00:00:01Z
+  token="$(issue_list_token carol)"
+  run storage_ack_receipt receipts carol --receipt "$token"
+  [ "$status" -eq 0 ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM receipt_nonces WHERE nonce='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';")" = 0 ]
+}
+
+@test "Task 4 storage capability is advertised only with the complete ack ABI" {
+  ack_abi_required
+  [ "$(storage_describe | awk -F= '$1=="capabilities"{print $2}')" = \
+    stage1-sync,stage1-resync,stage2-read-state,sqlite-receipt-ack-v1 ]
 }
