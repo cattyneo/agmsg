@@ -596,9 +596,11 @@ assert_crash_marker() {
 
   storage_send receipts alice bob first >/dev/null
   local later; later="$(storage_send receipts alice bob later)"
-  run storage_get_message_bounded receipts bob "$later" --max-body-bytes 4096 --issue-receipt
+  run --separate-stderr storage_get_message_bounded receipts bob "$later" --max-body-bytes 4096 --issue-receipt
   [ "$status" -ne 0 ]
   [ -z "$output" ]
+  [ -n "$stderr" ]
+  [ "$(printf '%s' "$stderr" | wc -c | tr -d ' ')" -le 4096 ]
 }
 
 @test "ack validates through the optional operation and never writes stdout on failure" {

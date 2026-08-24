@@ -25,6 +25,17 @@ receipt_dir() { printf '%s/receipt-v1' "$(dirname "$(agmsg_db_path receipts)")";
 receipt_public_key() { printf '%s/public.pem' "$(receipt_dir)"; }
 receipt_private_key() { printf '%s/private.pem' "$(receipt_dir)"; }
 
+fixture_field() {
+  local section="$1" field="$2"
+  awk -v section="[$section]" -v field="$field" '
+    $0 == section { active=1; next }
+    active && /^\[/ { exit }
+    active && index($0, field "=") == 1 {
+      print substr($0, length(field) + 2); exit
+    }
+  ' "$BATS_TEST_DIRNAME/fixtures/receipt-v1-vectors.txt"
+}
+
 hex_of() { LC_ALL=C printf '%s' "$1" | xxd -p -c 1000000 | tr -d '\n'; }
 
 sql_event() {
@@ -101,7 +112,11 @@ assert_zero_stdout_failure() {
   [ "$(receipt_record "$output" | jq -r '.receipt_version,.selected_count' | paste -sd: -)" = 1:2 ]
   token="$(receipt_token "$output")"
   [ "${#token}" -le 2048 ]
-  [[ "$token" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]
+  case "$token" in
+    *[!A-Za-z0-9_.-]*|.*|*.|*.*.*) return 1 ;;
+    *.*) ;;
+    *) return 1 ;;
+  esac
   decode_receipt "$token"
   payload="$RECEIPT_PAYLOAD"
   [ "$(printf '%s\n' "$payload" | sed -n '1p;2p;7p' | paste -sd: -)" = v=1:driver=sqlite:selected_count=2 ]
@@ -109,11 +124,29 @@ assert_zero_stdout_failure() {
   [ "$(durable_state)" = "$before" ]
 }
 
+@test "receipt selection honors the existing item and cumulative body bounds" {
+  sql_event bounded-a alice bob aa 2026-01-01T00:00:00Z
+  sql_event bounded-b alice bob bbb 2026-01-01T00:00:01Z
+  sql_event bounded-c alice bob c 2026-01-01T00:00:02Z
+  run storage_list_unread_bounded receipts bob --limit-items 10 --max-body-bytes 4 --issue-receipt
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | jq -r 'select(.type=="message_sent") | .id')" = bounded-a ]
+  [ "$(printf '%s\n' "$output" | jq -r 'select(.type=="bounded_unread_result") | [.selected_count,.selected_body_bytes,.remaining_count,.remaining_body_bytes] | join(":")')" = 1:2:2:4 ]
+  [ "$(receipt_record "$output" | jq -r '.selected_count')" = 1 ]
+
+  run storage_list_unread_bounded receipts bob --limit-items 2 --max-body-bytes 4096 --issue-receipt
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | jq -r 'select(.type=="message_sent") | .id' | paste -sd, -)" = bounded-a,bounded-b ]
+  [ "$(receipt_record "$output" | jq -r '.selected_count')" = 2 ]
+}
+
 @test "empty receipt list emits the unchanged result and no receipt" {
-  local before
+  local before ordinary
   before="$(durable_state)"
+  ordinary="$(storage_list_unread_bounded receipts bob --limit-items 10 --max-body-bytes 4096)"
   run storage_list_unread_bounded receipts bob --limit-items 10 --max-body-bytes 4096 --issue-receipt
   [ "$status" -eq 0 ]
+  [ "$output" = "$ordinary" ]
   [ "$(printf '%s\n' "$output" | jq -r '.type')" = bounded_unread_result ]
   [ "$(printf '%s\n' "$output" | jq -r '.selected_count')" = 0 ]
   [ "$(durable_state)" = "$before" ]
@@ -145,7 +178,8 @@ assert_zero_stdout_failure() {
   [ "${#token}" -le 2048 ]
   decode_receipt "$token"
   lines="$(printf '%s\n' "$RECEIPT_PAYLOAD" | wc -l | tr -d ' ')"
-  [ "$lines" -eq 14 ]
+  [ "$lines" -eq 13 ]
+  [ "$(tail -c 1 "$BATS_TEST_TMPDIR/payload.bin" | od -An -tu1 | tr -d ' ')" = 10 ]
   printf '%s\n' "$RECEIPT_PAYLOAD" | grep -Eq '^store_generation=[0-9a-f]{32}$'
   printf '%s\n' "$RECEIPT_PAYLOAD" | grep -Eq '^key_sha256=[0-9a-f]{64}$'
   printf '%s\n' "$RECEIPT_PAYLOAD" | grep -Eq '^team_hex=[0-9a-f]+$'
@@ -158,18 +192,76 @@ assert_zero_stdout_failure() {
     v,driver,store_generation,key_sha256,team_hex,recipient_hex,selected_count,batch_sha256,frame_sha256,issuance_frontier,issued_at,expires_at,nonce ]
 }
 
+@test "the shared canonicalizer matches fixed frame and payload vectors and hashes each raw body independently" {
+  agmsg_receipt_resolve_runtime
+  local rows="$BATS_TEST_TMPDIR/vector.rows" frame="$BATS_TEST_TMPDIR/frame"
+  local payload="$BATS_TEST_TMPDIR/payload" batch_rows="$BATS_TEST_TMPDIR/batch.rows"
+  local batch="$BATS_TEST_TMPDIR/batch" expected="$BATS_TEST_TMPDIR/batch.expected"
+  printf '0|7465616d2d61|616c696365|626f62|323032362d30312d30325430333a30343a30355a|event|42|61|78\n' >"$rows"
+  _agmsg_receipt_canonicalize frame "$rows" "$frame"
+  [ "$(xxd -p -c 1000000 "$frame" | tr -d '\n')" = "$(fixture_field frame-payload-base material_hex)" ]
+  _agmsg_receipt_canonicalize payload "$payload" \
+    0123456789abcdef0123456789abcdef \
+    abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 \
+    7465616d2d61 626f62 1 \
+    "$(fixture_field batch-base sha256)" "$(fixture_field frame-payload-base sha256)" \
+    42 1700000000 1700000900 00112233445566778899aabbccddeeff
+  [ "$(xxd -p -c 1000000 "$payload" | tr -d '\n')" = "$(fixture_field payload-base material_hex)" ]
+
+  printf '0|74|61|72|323032362d30312d30325430333a30343a30355a|event|7|696431|6162636465666768\n1|74|61|72|323032362d30312d30325430333a30343a30365a|event|8|696432|78\n' >"$batch_rows"
+  _agmsg_receipt_canonicalize batch "$batch_rows" "$batch"
+  {
+    printf 'agmsg-batch-v1\n'
+    printf 'id_len=3\nid_hex=696431\nbody_sha256=%s\n' "$(printf abcdefgh | shasum -a 256 | awk '{print $1}')"
+    printf 'id_len=3\nid_hex=696432\nbody_sha256=%s\n' "$(printf x | shasum -a 256 | awk '{print $1}')"
+  } >"$expected"
+  cmp -s "$batch" "$expected"
+}
+
 @test "receipt binds opaque IDs and raw bodies only through canonical digests" {
-  local opaque='opaque/id:秘密?x=1' body='private-body-sentinel-91bc4e72' output token
+  local opaque='opaque/id:秘密?x=1' body='private-body-sentinel-91bc4e72' output token wrapper
   sql_event "$opaque" alice bob "$body" 2026-01-01T00:00:00Z
+  wrapper="$BATS_TEST_TMPDIR/openssl-argv-log"
+  cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$RECEIPT_ARGV_LOG"
+exec "$REAL_RECEIPT_OPENSSL" "$@"
+SH
+  chmod 755 "$wrapper"
+  export REAL_RECEIPT_OPENSSL="$(command -v openssl)"
+  export RECEIPT_ARGV_LOG="$BATS_TEST_TMPDIR/openssl.argv"
+  export AGMSG_RECEIPT_OPENSSL="$wrapper"
   output="$(storage_list_unread_bounded receipts bob --limit-items 1 --max-body-bytes 4096 --issue-receipt)"
   token="$(receipt_token "$output")"
   decode_receipt "$token"
-  [[ "$output" == *"$opaque"* ]]
-  [[ "$output" == *"$body"* ]]
-  [[ "$RECEIPT_PAYLOAD" != *"$opaque"* ]]
-  [[ "$RECEIPT_PAYLOAD" != *"$body"* ]]
-  [[ "$token" != *"$opaque"* ]]
-  [[ "$token" != *"$body"* ]]
+  printf '%s' "$output" | grep -Fq -- "$opaque"
+  printf '%s' "$output" | grep -Fq -- "$body"
+  refute grep -Fq -- "$opaque" <<<"$RECEIPT_PAYLOAD"
+  refute grep -Fq -- "$body" <<<"$RECEIPT_PAYLOAD"
+  refute grep -Fq -- "$opaque" <<<"$token"
+  refute grep -Fq -- "$body" <<<"$token"
+  refute grep -Fq -- "$opaque" "$RECEIPT_ARGV_LOG"
+  refute grep -Fq -- "$body" "$RECEIPT_ARGV_LOG"
+}
+
+@test "receipt show keeps its opaque selector out of sqlite3 process arguments" {
+  local opaque='opaque/show:秘密?private=1' wrapper_dir="$BATS_TEST_TMPDIR/sqlite-wrapper"
+  sql_event "$opaque" alice bob body 2026-01-01T00:00:00Z
+  mkdir "$wrapper_dir"
+  export REAL_RECEIPT_SQLITE="$(command -v sqlite3)"
+  export RECEIPT_SQLITE_ARGV_LOG="$BATS_TEST_TMPDIR/sqlite.argv"
+  cat >"$wrapper_dir/sqlite3" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$RECEIPT_SQLITE_ARGV_LOG"
+exec "$REAL_RECEIPT_SQLITE" "$@"
+SH
+  chmod 755 "$wrapper_dir/sqlite3"
+  PATH="$wrapper_dir:$PATH"
+  export PATH
+  run storage_get_message_bounded receipts bob "$opaque" --max-body-bytes 4096 --issue-receipt
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | sed -n '1p' | jq -r '.id')" = "$opaque" ]
+  refute grep -Fq -- "$opaque" "$RECEIPT_SQLITE_ARGV_LOG"
 }
 
 @test "receipt token and completed-record caps fail before any stdout" {
@@ -247,6 +339,37 @@ SH
   [ "$frontier" = "$old_frontier" ]
   sql_event appended alice bob appended 2026-01-01T00:00:04Z
   [ "$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^issuance_frontier=//p')" = "$old_frontier" ]
+}
+
+@test "public records and private receipt material come from one SQLite snapshot" {
+  sql_event snapshot-a alice bob before-a 2026-01-01T00:00:00Z
+  sql_event snapshot-b alice bob before-b 2026-01-01T00:00:01Z
+  export SNAPSHOT_DB="$(agmsg_db_path receipts)"
+  export SNAPSHOT_MARKER="$BATS_TEST_TMPDIR/snapshot-query-complete"
+  agmsg_sqlite() {
+    local joined="$*" rc
+    command sqlite3 "$@"
+    rc=$?
+    if [ "$rc" -eq 0 ] && [[ "$joined" == *'__agmsg_receipt_meta|'* ]] &&
+       [ ! -e "$SNAPSHOT_MARKER" ]; then
+      : >"$SNAPSHOT_MARKER"
+      command sqlite3 "$SNAPSHOT_DB" "
+        INSERT INTO events(type,id,team,from_agent,to_agent,body,at)
+        VALUES('message_sent','snapshot-concurrent','receipts','alice','bob',
+               'after-query','2026-01-01T00:00:02Z');" >/dev/null
+    fi
+    return "$rc"
+  }
+
+  local output token frontier
+  output="$(storage_list_unread_bounded receipts bob --limit-items 10 --max-body-bytes 4096 --issue-receipt)"
+  [ -e "$SNAPSHOT_MARKER" ]
+  [ "$(printf '%s\n' "$output" | jq -r 'select(.type=="message_sent") | .id' | paste -sd, -)" = snapshot-a,snapshot-b ]
+  [ "$(receipt_record "$output" | jq -r '.selected_count')" = 2 ]
+  token="$(receipt_token "$output")"
+  decode_receipt "$token"
+  frontier="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^issuance_frontier=//p')"
+  [ "$frontier" -lt "$(sqlite3 "$SNAPSHOT_DB" "SELECT seq FROM sqlite_sequence WHERE name='events';")" ]
 }
 
 @test "ordinary bounded paths remain byte-for-byte unchanged and do not require receipt state" {

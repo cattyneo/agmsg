@@ -639,6 +639,195 @@ ORDER BY phase,ord;
 SQL
 }
 
+# Receipt issuance uses a separate, opt-in statement so ordinary phase-1 reads
+# remain byte-for-byte untouched and never probe receipt state. One SELECT
+# snapshot emits both public records and private hex-only canonicalization rows.
+_sqlite_receipt_list_sql() {
+  local team="$1" agent="$2" limit="$3" max_bytes="$4" max_record="$5" cte
+  cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  cat <<SQL
+$cte,
+ordered AS (
+  SELECT u.*, length(CAST(u.body AS BLOB)) AS body_bytes,
+         row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n,
+         sum(length(CAST(u.body AS BLOB))) OVER
+           (ORDER BY u.ts,u.src,u.ord ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           AS cumulative_bytes,
+         length(CAST(json_object('type','message_sent','id',u.id,'team',u.team,
+           'from',u.from_agent,'to',u.to_agent,'body',u.body,'at',u.at) AS BLOB))
+           AS record_bytes
+    FROM unread u
+),
+checks AS (
+  SELECT COUNT(*) AS total_count,
+         COALESCE(SUM(body_bytes),0) AS total_body_bytes,
+         COALESCE(SUM(CASE WHEN typeof(id)!='text' OR typeof(team)!='text'
+                              OR typeof(from_agent)!='text' OR typeof(to_agent)!='text'
+                              OR typeof(body)!='text' OR typeof(at)!='text'
+                           THEN 1 ELSE 0 END),0) AS bad_count,
+         COUNT(*)-COUNT(DISTINCT id) AS duplicate_count,
+         COALESCE(SUM(CASE WHEN record_bytes>$max_record THEN 1 ELSE 0 END),0) AS oversize_count,
+         COALESCE(MAX(CASE WHEN n=1 THEN body_bytes END),0) AS first_body_bytes
+    FROM ordered
+),
+state AS (
+  SELECT CASE WHEN bad_count>0 OR duplicate_count>0 OR oversize_count>0 THEN 'invalid'
+              WHEN $limit>0 AND total_count>0 AND first_body_bytes>$max_bytes THEN 'overflow'
+              ELSE 'ok' END AS status,total_count,total_body_bytes
+    FROM checks
+),
+selected AS (
+  SELECT * FROM ordered,state
+   WHERE state.status='ok' AND n<=$limit AND cumulative_bytes<=$max_bytes
+),
+selection AS (
+  SELECT COUNT(*) AS selected_count,COALESCE(SUM(body_bytes),0) AS selected_body_bytes
+    FROM selected
+),
+identity AS (
+  SELECT (SELECT value FROM receipt_meta WHERE key='store_generation') AS generation,
+         (SELECT value FROM receipt_meta WHERE key='public_key_sha256') AS key_sha256,
+         COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0) AS frontier
+)
+SELECT line FROM (
+  SELECT 0 AS phase,0 AS ord,
+         json_object('type','__agmsg_bounded_status','status',status) AS line FROM state
+  UNION ALL
+  SELECT 1,n,json_object('type','message_sent','id',id,'team',team,
+         'from',from_agent,'to',to_agent,'body',body,'at',at) FROM selected
+  UNION ALL
+  SELECT 2,0,json_object('type','bounded_unread_result',
+         'selected_count',selection.selected_count,
+         'selected_body_bytes',selection.selected_body_bytes,
+         'remaining_count',state.total_count-selection.selected_count,
+         'remaining_body_bytes',state.total_body_bytes-selection.selected_body_bytes,
+         'limit_items',$limit,'max_body_bytes',$max_bytes)
+    FROM state,selection WHERE state.status='ok'
+  UNION ALL
+  SELECT 3,0,'__agmsg_receipt_meta|' || identity.generation || '|' ||
+         identity.key_sha256 || '|' || identity.frontier || '|' || selection.selected_count
+    FROM state,selection,identity
+   WHERE state.status='ok' AND selection.selected_count>0
+  UNION ALL
+  SELECT 4,n,'__agmsg_receipt_row|' || (n-1) || '|' || lower(hex(CAST(team AS BLOB))) ||
+         '|' || lower(hex(CAST(from_agent AS BLOB))) || '|' || lower(hex(CAST(to_agent AS BLOB))) ||
+         '|' || lower(hex(CAST(at AS BLOB))) || '|' || CASE src WHEN 1 THEN 'event' ELSE 'legacy' END ||
+         '|' || ord || '|' || lower(hex(CAST(id AS BLOB))) || '|' || lower(hex(CAST(body AS BLOB)))
+    FROM selected
+)
+ORDER BY phase,ord;
+SQL
+}
+
+_sqlite_receipt_show_sql() {
+  local team="$1" agent="$2" message_id="$3" max_bytes="$4" max_record="$5"
+  local cte id_lit
+  cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  id_lit="$(_sqlite_lit "$message_id")"
+  cat <<SQL
+$cte,
+ordered AS (
+  SELECT u.*,length(CAST(u.body AS BLOB)) AS body_bytes,
+         row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n,
+         length(CAST(json_object('type','message_sent','id',u.id,'team',u.team,
+           'from',u.from_agent,'to',u.to_agent,'body',u.body,'at',u.at) AS BLOB)) AS record_bytes
+    FROM unread u
+),
+checks AS (
+  SELECT (SELECT COUNT(*) FROM ordered WHERE id='$id_lit') AS target_count,
+         COALESCE((SELECT SUM(CASE WHEN typeof(id)!='text' OR typeof(team)!='text'
+                              OR typeof(from_agent)!='text' OR typeof(to_agent)!='text'
+                              OR typeof(body)!='text' OR typeof(at)!='text'
+                           THEN 1 ELSE 0 END) FROM ordered),0) AS bad_count,
+         (SELECT COUNT(*) FROM ordered)-(SELECT COUNT(DISTINCT id) FROM ordered) AS duplicate_count
+),
+state AS (
+  SELECT CASE WHEN bad_count>0 OR duplicate_count>0 THEN 'invalid'
+              WHEN target_count!=1 THEN 'not_found'
+              WHEN (SELECT n FROM ordered WHERE id='$id_lit')!=1 THEN 'not_prefix'
+              WHEN (SELECT body_bytes FROM ordered WHERE id='$id_lit')>$max_bytes THEN 'overflow'
+              WHEN (SELECT record_bytes FROM ordered WHERE id='$id_lit')>$max_record THEN 'invalid'
+              ELSE 'ok' END AS status FROM checks
+),
+selected AS (SELECT * FROM ordered,state WHERE id='$id_lit' AND state.status='ok'),
+identity AS (
+  SELECT (SELECT value FROM receipt_meta WHERE key='store_generation') AS generation,
+         (SELECT value FROM receipt_meta WHERE key='public_key_sha256') AS key_sha256,
+         COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0) AS frontier
+)
+SELECT line FROM (
+  SELECT 0 AS phase,0 AS ord,
+         json_object('type','__agmsg_bounded_status','status',status) AS line FROM state
+  UNION ALL
+  SELECT 1,n,json_object('type','message_sent','id',id,'team',team,
+         'from',from_agent,'to',to_agent,'body',body,'at',at) FROM selected
+  UNION ALL
+  SELECT 2,0,'__agmsg_receipt_meta|' || identity.generation || '|' ||
+         identity.key_sha256 || '|' || identity.frontier || '|1'
+    FROM state,identity WHERE state.status='ok'
+  UNION ALL
+  SELECT 3,n,'__agmsg_receipt_row|0|' || lower(hex(CAST(team AS BLOB))) ||
+         '|' || lower(hex(CAST(from_agent AS BLOB))) || '|' || lower(hex(CAST(to_agent AS BLOB))) ||
+         '|' || lower(hex(CAST(at AS BLOB))) || '|' || CASE src WHEN 1 THEN 'event' ELSE 'legacy' END ||
+         '|' || ord || '|' || lower(hex(CAST(id AS BLOB))) || '|' || lower(hex(CAST(body AS BLOB)))
+    FROM selected
+)
+ORDER BY phase,ord;
+SQL
+}
+
+_sqlite_receipt_parse_args() {
+  local issue=0 arg
+  local -a filtered
+  filtered=()
+  for arg in "$@"; do
+    if [ "$arg" = --issue-receipt ]; then
+      [ "$issue" -eq 0 ] || {
+        printf 'storage: duplicate --issue-receipt option\n' >&2
+        return 13
+      }
+      issue=1
+    else
+      filtered[${#filtered[@]}]="$arg"
+    fi
+  done
+  _AGMSG_RECEIPT_ISSUE_REQUESTED="$issue"
+  _agmsg_bounded_parse_args "${filtered[@]}"
+}
+
+_sqlite_receipt_parse_show_args() {
+  local issue=0 arg
+  local -a filtered
+  filtered=()
+  for arg in "$@"; do
+    if [ "$arg" = --issue-receipt ]; then
+      [ "$issue" -eq 0 ] || {
+        printf 'storage: duplicate --issue-receipt option\n' >&2
+        return 13
+      }
+      issue=1
+    else
+      filtered[${#filtered[@]}]="$arg"
+    fi
+  done
+  _AGMSG_RECEIPT_ISSUE_REQUESTED="$issue"
+  _agmsg_bounded_parse_show_args "${filtered[@]}"
+}
+
+_sqlite_receipt_issue_preflight() {
+  local team="$1" recipient="$2"
+  if ! agmsg_validate_team_name "$team" >/dev/null 2>&1 ||
+     ! agmsg_validate_agent_name "$recipient" >/dev/null 2>&1; then
+      _agmsg_receipt_error 'invalid receipt scope'
+      return 13
+  fi
+  _agmsg_receipt_platform || return $?
+  _agmsg_receipt_validate_store "$team" || return $?
+  agmsg_receipt_resolve_runtime || return $?
+  _agmsg_receipt_capability_claim_check "$team" || return $?
+  _agmsg_receipt_validate_ready "$team" || return $?
+}
+
 _sqlite_bounded_public_result() {
   local output="$1" expected="$2" on_overflow="${3:-0}" first rest
   first="$(printf '%s\n' "$output" | sed -n '1p')"
@@ -673,8 +862,22 @@ storage_unread_summary() {
 storage_list_unread_bounded() {
   local team="$1" agent="$2" db output
   shift 2
-  _agmsg_bounded_parse_args "$@" || return 13
+  _sqlite_receipt_parse_args "$@" || return 13
   db="$(_sqlite_db "$team")" || return 13
+  if [ "$_AGMSG_RECEIPT_ISSUE_REQUESTED" -eq 1 ]; then
+    [ -f "$db" ] && [ -r "$db" ] || {
+      _agmsg_receipt_error 'receipt state is not initialized'
+      return 13
+    }
+    _sqlite_receipt_issue_preflight "$team" "$agent" || return $?
+    output="$(_sqlite_data "$team" "$(_sqlite_receipt_list_sql "$team" "$agent" "$_AGMSG_BOUNDED_LIMIT" "$_AGMSG_BOUNDED_MAX_BODY_BYTES" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")")" || return 13
+    case "$(printf '%s\n' "$output" | sed -n '1p')" in
+      '{"type":"__agmsg_bounded_status","status":"ok"}') ;;
+      *) _agmsg_receipt_error 'receipt snapshot validation failed'; return 13 ;;
+    esac
+    printf '%s\n' "$output" | tail -n +2 | _agmsg_receipt_issue_stream "$team" "$agent"
+    return $?
+  fi
   if [ ! -e "$db" ] && [ ! -L "$db" ]; then
     _agmsg_bounded_emit_records "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"
     return $?
@@ -695,8 +898,25 @@ storage_get_message_bounded() {
   local team="$1" agent="$2" message_id="$3" db output first rest
   shift 3
   [ -n "$message_id" ] || { printf 'storage: message id is required\n' >&2; return 13; }
-  _agmsg_bounded_parse_show_args "$@" || return 13
+  _sqlite_receipt_parse_show_args "$@" || return 13
   db="$(_sqlite_db "$team")" || return 13
+  if [ "$_AGMSG_RECEIPT_ISSUE_REQUESTED" -eq 1 ]; then
+    [ -f "$db" ] && [ -r "$db" ] || {
+      _agmsg_receipt_error 'receipt state is not initialized'
+      return 13
+    }
+    _sqlite_receipt_issue_preflight "$team" "$agent" || return $?
+    # The opaque ID is already the public show selector, but it still must not
+    # be copied into sqlite3's process argv. The receipt-only statement goes
+    # over stdin; ordinary phase-1 show remains byte-for-byte unchanged.
+    output="$(_sqlite_data_stdin "$team" "$(_sqlite_receipt_show_sql "$team" "$agent" "$message_id" "$_AGMSG_BOUNDED_MAX_BODY_BYTES" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")")" || return 13
+    case "$(printf '%s\n' "$output" | sed -n '1p')" in
+      '{"type":"__agmsg_bounded_status","status":"ok"}') ;;
+      *) _agmsg_receipt_error 'receipt show requires the first unread row'; return 13 ;;
+    esac
+    printf '%s\n' "$output" | tail -n +2 | _agmsg_receipt_issue_stream "$team" "$agent"
+    return $?
+  fi
   if [ ! -e "$db" ] && [ ! -L "$db" ]; then
     printf 'storage: message not found\n' >&2
     return 13

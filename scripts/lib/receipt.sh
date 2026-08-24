@@ -355,6 +355,215 @@ _agmsg_receipt_validate_ready() {
   fi
 }
 
+# Canonicalize receipt-v1 material through one implementation shared by issue
+# and (in Task 4) acknowledgement. Inputs are already-private hex/decimal
+# fields; raw message IDs and bodies are never passed to an external command.
+#
+# batch/frame input records use this exact pipe-delimited shape:
+#   index|team_hex|from_hex|to_hex|at_hex|source|source_ord|id_hex|body_hex
+# Payload mode receives the frozen scalar fields as positional arguments.
+_agmsg_receipt_canonicalize() {
+  local kind="$1"
+  shift
+  case "$kind" in
+    batch|frame)
+      local rows="$1" destination="$2"
+      local index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra
+      local id_len team_len from_len to_len at_len digest output hex_file body_file
+      [ -f "$rows" ] && [ ! -L "$rows" ] || return 13
+      hex_file="${destination}.body.hex"
+      body_file="${destination}.body.bin"
+      case "$kind" in
+        batch) printf 'agmsg-batch-v1\n' >"$destination" || return 13 ;;
+        frame) printf 'agmsg-frame-v1\n' >"$destination" || return 13 ;;
+      esac
+      while IFS='|' read -r index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra; do
+        [ -z "$extra" ] || return 13
+        case "$index:$source_ord" in *[!0-9:]*|:*|*:) return 13 ;; esac
+        [ "$index" = 0 ] || [ "${index#0}" = "$index" ] || return 13
+        [ "$source_ord" = 0 ] || [ "${source_ord#0}" = "$source_ord" ] || return 13
+        case "$source" in event|legacy) ;; *) return 13 ;; esac
+        for output in "$team_hex" "$from_hex" "$to_hex" "$at_hex" "$id_hex" "$body_hex"; do
+          [ $(( ${#output} % 2 )) -eq 0 ] || return 13
+          case "$output" in *[!0-9a-f]*) return 13 ;; esac
+        done
+        id_len=$(( ${#id_hex} / 2 ))
+        team_len=$(( ${#team_hex} / 2 ))
+        from_len=$(( ${#from_hex} / 2 ))
+        to_len=$(( ${#to_hex} / 2 ))
+        at_len=$(( ${#at_hex} / 2 ))
+        case "$kind" in
+          batch)
+            printf '%s\n' "$body_hex" >"$hex_file" || return 13
+            "$AGMSG_RECEIPT_XXD_RESOLVED" -r -p "$hex_file" \
+              >"$body_file" 2>/dev/null || return 13
+            output="$("$AGMSG_RECEIPT_OPENSSL_RESOLVED" dgst -sha256 -r "$body_file" 2>/dev/null)" || return 13
+            IFS=' ' read -r digest _ <<EOF
+$output
+EOF
+            _agmsg_receipt_runtime_is_sha256 "$digest" || return 13
+            printf 'id_len=%s\nid_hex=%s\nbody_sha256=%s\n' \
+              "$id_len" "$id_hex" "$digest" >>"$destination" || return 13
+            ;;
+          frame)
+            printf 'index=%s\nteam_len=%s\nteam_hex=%s\nfrom_len=%s\nfrom_hex=%s\nto_len=%s\nto_hex=%s\nat_len=%s\nat_hex=%s\nsource=%s\nsource_ord=%s\n' \
+              "$index" "$team_len" "$team_hex" "$from_len" "$from_hex" \
+              "$to_len" "$to_hex" "$at_len" "$at_hex" "$source" \
+              "$source_ord" >>"$destination" || return 13
+            ;;
+        esac
+      done <"$rows"
+      /bin/rm -f -- "$hex_file" "$body_file" 2>/dev/null || return 13
+      ;;
+    payload)
+      [ "$#" -eq 12 ] || return 13
+      local destination="$1" store_generation="$2" key_sha256="$3"
+      local team_hex="$4" recipient_hex="$5" selected_count="$6"
+      local batch_sha256="$7" frame_sha256="$8" issuance_frontier="$9"
+      shift 9
+      local issued_at="$1" expires_at="$2" nonce="$3" expected_expiry
+      case "$store_generation" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) return 13 ;;
+      esac
+      _agmsg_receipt_runtime_is_sha256 "$key_sha256" || return 13
+      _agmsg_receipt_runtime_is_sha256 "$batch_sha256" || return 13
+      _agmsg_receipt_runtime_is_sha256 "$frame_sha256" || return 13
+      for output in "$team_hex" "$recipient_hex"; do
+        [ -n "$output" ] && [ $(( ${#output} % 2 )) -eq 0 ] || return 13
+        case "$output" in *[!0-9a-f]*) return 13 ;; esac
+      done
+      case "$selected_count" in 1|2|3|4|5|6|7|8|9|10) ;; *) return 13 ;; esac
+      for output in "$issuance_frontier" "$issued_at" "$expires_at"; do
+        case "$output" in ''|*[!0-9]*) return 13 ;; esac
+        [ "$output" = 0 ] || [ "${output#0}" = "$output" ] || return 13
+      done
+      expected_expiry=$((issued_at + 900))
+      [ "$expires_at" -eq "$expected_expiry" ] || return 13
+      case "$nonce" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) return 13 ;;
+      esac
+      printf 'v=1\ndriver=sqlite\nstore_generation=%s\nkey_sha256=%s\nteam_hex=%s\nrecipient_hex=%s\nselected_count=%s\nbatch_sha256=%s\nframe_sha256=%s\nissuance_frontier=%s\nissued_at=%s\nexpires_at=%s\nnonce=%s\n' \
+        "$store_generation" "$key_sha256" "$team_hex" "$recipient_hex" \
+        "$selected_count" "$batch_sha256" "$frame_sha256" \
+        "$issuance_frontier" "$issued_at" "$expires_at" "$nonce" \
+        >"$destination" || return 13
+      ;;
+    *) return 13 ;;
+  esac
+}
+
+_agmsg_receipt_file_sha256() {
+  local output digest
+  output="$("$AGMSG_RECEIPT_OPENSSL_RESOLVED" dgst -sha256 -r "$1" 2>/dev/null)" || return 13
+  IFS=' ' read -r digest _ <<EOF
+$output
+EOF
+  _agmsg_receipt_runtime_is_sha256 "$digest" || return 13
+  printf '%s\n' "$digest"
+}
+
+_agmsg_receipt_base64url_file() {
+  "$AGMSG_RECEIPT_OPENSSL_RESOLVED" base64 -A -in "$1" 2>/dev/null |
+    /usr/bin/tr '+/' '-_' | /usr/bin/tr -d '='
+}
+
+# Consume a validated SQLite snapshot on stdin, construct/sign the private
+# receipt in an owner-only temporary directory, and perform exactly one public
+# emitter call after every completed record has passed preflight.
+_agmsg_receipt_issue_stream() (
+  local team="$1" recipient="$2" snapshot tmp rows public line _marker
+  local generation key_sha256 frontier selected_count meta_count=0 row_count=0
+  local batch frame payload signature batch_sha256 frame_sha256 issued_at expires_at nonce
+  local payload_b64 signature_b64 token receipt records cleanup_status=0
+  snapshot="$(/bin/cat)" || exit 13
+  tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-issue.XXXXXX" 2>/dev/null)" || {
+    _agmsg_receipt_error 'cannot create private issuance directory'
+    exit 13
+  }
+  /bin/chmod 700 "$tmp" 2>/dev/null || {
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    _agmsg_receipt_error 'cannot protect private issuance directory'
+    exit 13
+  }
+  trap '/bin/rm -rf -- "$tmp" 2>/dev/null || true' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  rows="$tmp/rows"; public="$tmp/public"
+  : >"$rows" && : >"$public" || exit 13
+  while IFS= read -r line; do
+    case "$line" in
+      __agmsg_receipt_meta\|*)
+        meta_count=$((meta_count + 1))
+        IFS='|' read -r _marker generation key_sha256 frontier selected_count <<EOF
+$line
+EOF
+        ;;
+      __agmsg_receipt_row\|*)
+        row_count=$((row_count + 1))
+        printf '%s\n' "${line#__agmsg_receipt_row|}" >>"$rows" || exit 13
+        ;;
+      *) printf '%s\n' "$line" >>"$public" || exit 13 ;;
+    esac
+  done <<EOF
+$snapshot
+EOF
+  [ -s "$public" ] || {
+    _agmsg_receipt_error 'receipt snapshot has no public record'
+    exit 13
+  }
+  if [ "$meta_count" -eq 0 ] && [ "$row_count" -eq 0 ]; then
+    records="$(/bin/cat "$public")" || exit 13
+    _agmsg_bounded_emit_records "$records" || exit 13
+    trap - EXIT HUP INT TERM
+    /bin/rm -rf -- "$tmp" 2>/dev/null || exit 13
+    exit 0
+  fi
+  [ "$meta_count" -eq 1 ] && [ "$row_count" -eq "$selected_count" ] || {
+    _agmsg_receipt_error 'receipt snapshot metadata is invalid'
+    exit 13
+  }
+  case "$selected_count" in 1|2|3|4|5|6|7|8|9|10) ;; *) exit 13 ;; esac
+  batch="$tmp/batch"; frame="$tmp/frame"; payload="$tmp/payload"
+  signature="$tmp/signature"
+  _agmsg_receipt_canonicalize batch "$rows" "$batch" || exit 13
+  _agmsg_receipt_canonicalize frame "$rows" "$frame" || exit 13
+  batch_sha256="$(_agmsg_receipt_file_sha256 "$batch")" || exit 13
+  frame_sha256="$(_agmsg_receipt_file_sha256 "$frame")" || exit 13
+  issued_at="$(/bin/date +%s)"
+  case "$issued_at" in ''|*[!0-9]*) exit 13 ;; esac
+  expires_at=$((issued_at + 900))
+  nonce="$("$AGMSG_RECEIPT_OPENSSL_RESOLVED" rand -hex 16 2>/dev/null)" || exit 13
+  _agmsg_receipt_canonicalize payload "$payload" "$generation" "$key_sha256" \
+    "$(printf '%s' "$team" | "$AGMSG_RECEIPT_XXD_RESOLVED" -p -c 1000000 | /usr/bin/tr -d '\n')" \
+    "$(printf '%s' "$recipient" | "$AGMSG_RECEIPT_XXD_RESOLVED" -p -c 1000000 | /usr/bin/tr -d '\n')" \
+    "$selected_count" "$batch_sha256" "$frame_sha256" "$frontier" \
+    "$issued_at" "$expires_at" "$nonce" || exit 13
+  "$AGMSG_RECEIPT_OPENSSL_RESOLVED" pkeyutl -sign -rawin \
+    -inkey "$(_agmsg_receipt_private_key "$team")" -in "$payload" \
+    -out "$signature" >/dev/null 2>&1 || {
+    _agmsg_receipt_error 'cannot sign receipt'
+    exit 13
+  }
+  payload_b64="$(_agmsg_receipt_base64url_file "$payload")" || exit 13
+  signature_b64="$(_agmsg_receipt_base64url_file "$signature")" || exit 13
+  case "$payload_b64" in ''|*[!A-Za-z0-9_-]*) exit 13 ;; esac
+  case "$signature_b64" in ''|*[!A-Za-z0-9_-]*) exit 13 ;; esac
+  token="$payload_b64.$signature_b64"
+  [ "${#token}" -le 2048 ] || {
+    _agmsg_receipt_error 'receipt token exceeds output policy'
+    exit 13
+  }
+  receipt="{\"type\":\"bounded_unread_receipt\",\"receipt_version\":1,\"selected_count\":$selected_count,\"issued_at\":$issued_at,\"expires_at\":$expires_at,\"receipt\":\"$token\"}"
+  records="$(/bin/cat "$public")"$'\n'"$receipt" || exit 13
+  _agmsg_bounded_emit_records "$records" || exit 13
+  trap - EXIT HUP INT TERM
+  /bin/rm -rf -- "$tmp" 2>/dev/null || cleanup_status=$?
+  [ "$cleanup_status" -eq 0 ] || exit 13
+)
+
 _AGMSG_RECEIPT_INIT_LOCK=
 _AGMSG_RECEIPT_INIT_STAGE=
 _AGMSG_RECEIPT_INIT_NONCE=
