@@ -227,7 +227,10 @@ post-acquisition leaves the valid fixed lock. After acquiring or reclaiming,
 init rechecks complete state before writing.
 
 The crash matrix runs on a POSIX runner with shell command-shadowing, SQLite,
-and OpenSSL 3. It launches a real initializer and test-side wrappers for
+and OpenSSL 3, and requires a usable `ps` identity containing process start
+time and command before it spawns a background process. A runner without that
+identity proof skips the crash/lock process cases rather than risking a signal
+to a recycled PID. It launches a real initializer and test-side wrappers for
 `ln`, OpenSSL, and `sqlite3` pause only at observed filesystem/metadata
 milestones before `SIGKILL`: receipt directory, private key, public key, the
 single atomic `receipt_meta` commit (schema plus all three required rows),

@@ -9,7 +9,7 @@ load test_helper
 setup() {
   setup_test_env
   TEST_OWNED_PIDS=''
-  DIAGNOSTIC_SENTINEL='receipt-v1.diag-sentinel_7a6e19f4'
+  DIAGNOSTIC_SENTINEL='eyJ2IjoxLCJ0eXBlIjoicmVjZWlwdCJ9.c2lnbmF0dXJlX3NlbnRpbmVs'
   DIAGNOSTIC_SECRET_FRAGMENT='headerless-secret-fragment-91bc4e72'
   export DIAGNOSTIC_SENTINEL DIAGNOSTIC_SECRET_FRAGMENT
   export SKILL_DIR="$TEST_SKILL_DIR"
@@ -23,6 +23,11 @@ setup() {
 
 test_process_identity() {
   ps -p "$1" -o lstart= -o command= 2>/dev/null | sed 's/^ *//'
+}
+
+skip_unless_process_identity() {
+  command -v ps >/dev/null 2>&1 || skip "requires ps process identity before background spawn"
+  [ -n "$(test_process_identity "$$")" ] || skip "requires ps lstart and command identity before background spawn"
 }
 
 register_test_pid() {
@@ -53,6 +58,24 @@ registered_pid_matches() {
 $TEST_OWNED_PIDS
 EOF
   return 1
+}
+
+wait_for_test_owned_exit() {
+  local pid="$1" kind="$2" deadline
+  case "$kind" in
+    child)
+      wait "$pid" 2>/dev/null || true
+      ! registered_pid_matches "$pid"
+      ;;
+    orphan)
+      deadline=$(( $(date +%s) + 2 ))
+      while kill -0 "$pid" 2>/dev/null && registered_pid_matches "$pid"; do
+        [ "$(date +%s)" -lt "$deadline" ] || return 1
+        sleep 0.05
+      done
+      ;;
+    *) return 2 ;;
+  esac
 }
 
 release_test_waiters() {
@@ -210,6 +233,7 @@ assert_safe_diagnostics() {
 }
 
 dead_pid() {
+  skip_unless_process_identity
   sleep 1 &
   local pid=$!
   register_test_pid "$pid"
@@ -317,7 +341,7 @@ start_crashable_init() {
     sleep 0.05
   done
   registered_pid_matches "$RECEIPT_INIT_PID" && kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
-  wait "$RECEIPT_INIT_PID" 2>/dev/null || true
+  wait_for_test_owned_exit "$RECEIPT_INIT_PID" child
   unregister_test_pid "$RECEIPT_INIT_PID"
   false
 }
@@ -326,12 +350,8 @@ kill_crashable_init() {
   [ -s "$RECEIPT_CRASH_MARKER" ]
   registered_pid_matches "$RECEIPT_INIT_PID" && kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
   registered_pid_matches "$CRASH_WRAPPER_PID" && kill -9 "$CRASH_WRAPPER_PID" 2>/dev/null || true
-  wait "$RECEIPT_INIT_PID" 2>/dev/null || true
-  # Bash 3.2 has integer-only `read -t`; one bounded second is sufficient
-  # after SIGKILL and avoids a fractional-timeout compatibility dependency.
-  sleep 1
-  ! kill -0 "$RECEIPT_INIT_PID" 2>/dev/null
-  ! kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null
+  wait_for_test_owned_exit "$RECEIPT_INIT_PID" child
+  wait_for_test_owned_exit "$CRASH_WRAPPER_PID" orphan
   unregister_test_pid "$RECEIPT_INIT_PID"
   unregister_test_pid "$CRASH_WRAPPER_PID"
 }
@@ -411,6 +431,7 @@ assert_crash_marker() {
 }
 
 @test "concurrent receipt init is serialized and leaves a ready identity" {
+  skip_unless_process_identity
   init_ready
   local before="$RECEIPT_IDENTITY"
   local first="$BATS_TEST_TMPDIR/first" second="$BATS_TEST_TMPDIR/second"
@@ -502,7 +523,7 @@ assert_crash_marker() {
   assert_safe_diagnostics
 
   storage_send receipts alice bob first >/dev/null
-  local later forbidden_receipt=not-a-receipt-token
+  local later forbidden_receipt="$DIAGNOSTIC_SENTINEL"
   later="$(storage_send receipts alice bob later)"
   capture_receipt_command issue-refusal storage_get_message_bounded receipts bob "$later" \
     --max-body-bytes 4096 --issue-receipt
@@ -748,6 +769,7 @@ assert_crash_marker() {
 }
 
 @test "init rejects an unsafe lock mode without deleting it" {
+  skip_unless_process_identity
   init_ready
   local nonce=01112233445566778899aabbccddeeff lock
   lock="$(receipt_lock)"
@@ -759,29 +781,32 @@ assert_crash_marker() {
   [ "$(file_mode "$lock")" = 644 ]
 }
 
-@test "OpenSSL major-version refusal uses missing_deps without mutating state" {
+@test "OpenSSL major-version refusal sanitizes underlying stderr and leaves state unchanged" {
   init_ready
   local fake="$BATS_TEST_TMPDIR/openssl-major2" before after
   before="$(store_fingerprint)"
-  printf '#!/bin/bash\nif [ "${1:-}" = version ]; then echo "OpenSSL 2.9 fixture"; exit 0; fi\nexec "%s" "$@"\n' \
-    "$(command -v openssl)" >"$fake"
+  printf '#!/bin/bash\nprintf "%%s\\n" "$DIAGNOSTIC_SECRET_FRAGMENT" >&2\nif [ "${1:-}" = version ]; then echo "OpenSSL 2.9 fixture"; exit 0; fi\nexit 1\n' >"$fake"
   chmod 700 "$fake"
   export AGMSG_RECEIPT_OPENSSL="$fake"
-  run --separate-stderr storage_receipt_status receipts
-  assert_status 10 missing_deps
+  capture_receipt_command openssl-refusal storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 10 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = missing_deps ]
+  assert_safe_diagnostics
   after="$(store_fingerprint)"
   [ "$after" = "$before" ]
 }
 
-@test "xxd capability refusal uses missing_deps without mutating state" {
+@test "xxd capability refusal sanitizes underlying stderr and leaves state unchanged" {
   init_ready
   local fake="$BATS_TEST_TMPDIR/xxd-fail" before after
   before="$(store_fingerprint)"
-  printf '#!/bin/bash\nexit 1\n' >"$fake"
+  printf '#!/bin/bash\nprintf "%%s\\n" "$DIAGNOSTIC_SECRET_FRAGMENT" >&2\nexit 1\n' >"$fake"
   chmod 700 "$fake"
   export AGMSG_RECEIPT_XXD="$fake"
-  run --separate-stderr storage_receipt_status receipts
-  assert_status 10 missing_deps
+  capture_receipt_command xxd-refusal storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 10 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = missing_deps ]
+  assert_safe_diagnostics
   after="$(store_fingerprint)"
   [ "$after" = "$before" ]
 }
@@ -798,6 +823,7 @@ assert_crash_marker() {
 }
 
 @test "dead valid init lock is reclaimed only after its staging link is validated" {
+  skip_unless_process_identity
   init_ready
   local nonce=00112233445566778899aabbccddeeff stage lock
   stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
@@ -812,6 +838,7 @@ assert_crash_marker() {
 }
 
 @test "live init lock is refused and never removed" {
+  skip_unless_process_identity
   init_ready
   local nonce=10112233445566778899aabbccddeeff lock
   lock="$(receipt_lock)"
@@ -838,6 +865,7 @@ assert_crash_marker() {
 }
 
 @test "inode-mismatched staging and init lock are corrupt state" {
+  skip_unless_process_identity
   init_ready
   local nonce=20112233445566778899aabbccddeeff stage lock
   stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
@@ -853,6 +881,7 @@ assert_crash_marker() {
 }
 
 @test "live init lock refusal is bounded to the documented retry window" {
+  skip_unless_process_identity
   init_ready
   local nonce=30112233445566778899aabbccddeeff lock started elapsed
   lock="$(receipt_lock)"
@@ -874,6 +903,7 @@ assert_crash_marker() {
 # These require a POSIX runner with executable command-shadowing semantics;
 # native Git Bash has its own unsupported receipt boundary and is covered below.
 skip_unless_posix_crash_runner() {
+  skip_unless_process_identity
   case "$(uname -s)" in
     Darwin*|Linux*) command -v sqlite3 >/dev/null && receipt_test_openssl >/dev/null || skip "requires POSIX sqlite3 and OpenSSL 3 runner" ;;
     *) skip "requires a POSIX runner; native Git Bash is covered separately" ;;
@@ -881,8 +911,8 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "real SIGKILL before lock hard-link leaves only an initializer staging record" {
-  assert_receipt_abi
   skip_unless_posix_crash_runner
+  assert_receipt_abi
   start_crashable_init pre-link
   assert_crash_marker pre-link "$(receipt_lock)"
   kill_crashable_init
@@ -892,8 +922,8 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "real SIGKILL after lock hard-link preserves the exact two-link crash residue" {
-  assert_receipt_abi
   skip_unless_posix_crash_runner
+  assert_receipt_abi
   start_crashable_init post-link-before-unlink
   assert_crash_marker post-link-before-unlink "$(receipt_lock)"
   kill_crashable_init
@@ -906,8 +936,8 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "real SIGKILL after acquisition leaves only the fixed lock before key generation" {
-  assert_receipt_abi
   skip_unless_posix_crash_runner
+  assert_receipt_abi
   start_crashable_init after-acquisition
   assert_crash_marker after-acquisition "$(receipt_private_key)"
   kill_crashable_init
@@ -918,8 +948,8 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "real SIGKILL after receipt directory creation leaves no key material" {
-  assert_receipt_abi
   skip_unless_posix_crash_runner
+  assert_receipt_abi
   start_crashable_init directory-created
   assert_crash_marker directory-created "$(receipt_private_key)"
   kill_crashable_init
@@ -929,8 +959,8 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "real SIGKILL after private-key generation leaves no public key" {
-  assert_receipt_abi
   skip_unless_posix_crash_runner
+  assert_receipt_abi
   start_crashable_init private-created
   assert_crash_marker private-created "$(receipt_private_key)"
   kill_crashable_init
@@ -939,8 +969,8 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "real SIGKILL after public-key generation leaves the generated key pair" {
-  assert_receipt_abi
   skip_unless_posix_crash_runner
+  assert_receipt_abi
   start_crashable_init public-created
   assert_crash_marker public-created "$(receipt_public_key)"
   kill_crashable_init
@@ -949,8 +979,8 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "real SIGKILL after atomic receipt metadata commit leaves schema and all identity rows" {
-  assert_receipt_abi
   skip_unless_posix_crash_runner
+  assert_receipt_abi
   start_crashable_init metadata-committed
   assert_crash_marker metadata-committed "$(agmsg_db_path receipts)"
   kill_crashable_init
@@ -958,6 +988,7 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "SIGKILL pre-link residue is removed only when its dead staging record validates" {
+  skip_unless_process_identity
   init_ready
   local nonce=40112233445566778899aabbccddeeff stage
   stage="$(receipt_stage "$nonce")"
@@ -969,6 +1000,7 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "SIGKILL post-link pre-unlink residue reclaims the exact two-link record" {
+  skip_unless_process_identity
   init_ready
   local nonce=50112233445566778899aabbccddeeff stage lock
   stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
@@ -981,6 +1013,7 @@ skip_unless_posix_crash_runner() {
 }
 
 @test "SIGKILL after staging unlink reclaims a valid dead fixed lock" {
+  skip_unless_process_identity
   init_ready
   local nonce=60112233445566778899aabbccddeeff lock
   lock="$(receipt_lock)"
