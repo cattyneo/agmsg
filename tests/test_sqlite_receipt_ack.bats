@@ -102,8 +102,8 @@ assert_internal_receipt_failure() {
   local name="$1"
   shift
   assert_zero_stdout_failure "$name" "$@"
-  grep -Fxq -- 'agmsg receipt: cannot construct receipt' \
-    "$BATS_TEST_TMPDIR/$name.stderr"
+  [ "$(cat "$BATS_TEST_TMPDIR/$name.stderr")" = \
+    'agmsg receipt: cannot construct receipt' ]
 }
 
 @test "receipt list appends one final compact record after messages and result" {
@@ -418,6 +418,7 @@ SH
 
 @test "canonical payload and token syntax failures use the internal diagnostic" {
   local snapshot wrapper="$BATS_TEST_TMPDIR/openssl-invalid-base64"
+  agmsg_receipt_resolve_runtime
   snapshot='{"type":"bounded_unread_result","selected_count":1,"selected_body_bytes":1,"remaining_count":0,"remaining_body_bytes":0,"limit_items":1,"max_body_bytes":4096}
 __agmsg_receipt_meta|not-a-generation|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|1|1
 __agmsg_receipt_row|0|7265636569707473|616c696365|626f62|323032362d30312d30315430303a30303a30305a|event|1|6964|78'
