@@ -60,6 +60,12 @@ _sqlite_data_stdin() {
   ( set -o pipefail; printf '%s\n' "$2" | agmsg_sqlite -batch "$(_sqlite_db "$1")" | tr -d '\r' )
 }
 
+# The receipt state ABI is SQLite-only and opt-in. Sourcing these definitions
+# does not run a runtime probe, create state, advertise the complete capability,
+# or alter any legacy/bounded read path.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/receipt.sh"
+
 # IN (...) list of "team:agent" pairs.
 _sqlite_pair_in() {
   local out="" p t a

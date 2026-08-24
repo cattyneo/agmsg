@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+bats_require_minimum_version 1.5.0
+
 # Contract RED tests for Issue #211. This file deliberately uses only public
 # storage functions and isolated test stores; it must not add a test-only seam
 # to the receipt implementation.
@@ -521,7 +523,7 @@ assert_crash_marker() {
   cp -R "$TEST_SKILL_DIR/scripts" "$copy/"
   : >"$copy/scripts/lib/claims.sh"
 
-  run env AGMSG_STORAGE_DRIVER=sqlite AGMSG_STORAGE_PATH="$AGMSG_STORAGE_PATH" \
+  run --separate-stderr env AGMSG_STORAGE_DRIVER=sqlite AGMSG_STORAGE_PATH="$AGMSG_STORAGE_PATH" \
     AGMSG_CONFIG="$AGMSG_CONFIG" SKILL_DIR="$copy" /bin/bash -c '
       source "$SKILL_DIR/scripts/lib/storage.sh"
       agmsg_storage_load
