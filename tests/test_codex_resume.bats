@@ -54,7 +54,7 @@ make_rollout() {
   # shellcheck disable=SC1090
   source "$TYPES/codex/_transcript-exists.sh"
   make_rollout "abc-uuid" "/proj"
-  ! agmsg_transcript_exists "" "/proj"
+  refute agmsg_transcript_exists "" "/proj"
   HOME="" run agmsg_transcript_exists "abc-uuid" "/proj"
   [ "$status" -ne 0 ]
 }

@@ -192,13 +192,31 @@ teardown() {
   [[ "$output" == *"watcher pidfile present but process not running, installation-wide"* ]]
 }
 
+# A project whose settings file is READABLE and installs no agmsg hooks. That is
+# a genuine `off`: the configuration was consulted and says delivery is not set
+# up. Without this, a bare mktemp project has no settings file at all, and
+# `delivery.sh` reports `off (unrecognized: no settings file found …)` -- which
+# is a statement about what this check could not determine, not about the
+# configuration, and is deliberately NOT collapsed.
+configured_off() {
+  mkdir -p "$1/.claude"
+  printf '%s\n' '{"hooks":{}}' > "$1/.claude/settings.local.json"
+}
+
 @test "doctor: exits 0 and reports no warnings when nothing is registered as locked" {
+  configured_off "$PROJ"
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
   [ "$status" -eq 0 ]
   [[ "$output" == *"no warnings."* ]]
   # Nothing held, nothing configured -- collapses to the one-line "nothing
   # to report" form rather than a 6-line block naming lock=none per row.
   [[ "$output" == *"$PROJ  [claude-code]  1 registration, nothing to report"* ]]
+  # The collapsed line keeps the settings file it consulted. Five lines become
+  # one, but the four that go are the mode and three "entries: 0" -- the path is
+  # the only one answering a different question: WHICH file was read. Without it
+  # the line cannot be told apart from the case where nothing was read at all,
+  # which is the distinction the unrecognized case exists to preserve.
+  printf '%s\n' "$output" | grep -q -F -- "nothing to report — $PROJ/.claude/settings.local.json"
 }
 
 # --- readability: a (project, type) pair with nothing held, no warnings, and
@@ -207,7 +225,23 @@ teardown() {
 #     say "nothing here" -- unreadable at real scale even before the
 #     BLOCKING exit-code fix below stopped some of them being warnings. ------
 
+@test "doctor: a project it could not read is not called 'nothing to report'" {
+  # `off` and `off (unrecognized: …)` are different claims. The first is about
+  # the configuration; the second is about this check, which could not find the
+  # settings file. Collapsing the second tells the operator delivery is off when
+  # what happened is that we could not tell -- and hides the one line that
+  # explains an empty inbox ("this project may not be registered").
+  #
+  # $PROJ deliberately has NO settings file here.
+  run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "unrecognized"
+  printf '%s\n' "$output" | grep -q -F -- "may not be registered"
+  refute grep -qF -- "nothing to report" <<<"$output"
+}
+
 @test "doctor: a boring (project, type) pair -- no lock, no warning, mode off -- collapses to one line" {
+  configured_off "$PROJ"
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
   [ "$status" -eq 0 ]
   [[ "$output" == *"nothing to report"* ]]
@@ -216,6 +250,7 @@ teardown() {
 }
 
 @test "doctor: a boring pair with more than one registration still collapses, with the plural noun and correct count" {
+  configured_off "$PROJ"
   bash "$SCRIPTS/join.sh" team bob claude-code "$PROJ" >/dev/null
 
   run bash "$SCRIPTS/doctor.sh" --project "$PROJ" --type claude-code
@@ -224,6 +259,7 @@ teardown() {
 }
 
 @test "doctor: the collapsed one-line form is still redacted under --redacted" {
+  configured_off "$PROJ"
   case "$PROJ" in
     "$HOME"*) skip "fixture \$PROJ landed under \$HOME this run; this test needs it outside" ;;
   esac
@@ -426,6 +462,7 @@ teardown() {
 }
 
 @test "doctor: the default whole-install scope does not double-count a (project, type) registered under two different teams" {
+  configured_off "$PROJ"
   # agmsg_registered_projects dedups within one team's config.json but
   # concatenates every team's file with no cross-file dedup -- a second team
   # registered in the SAME project/type this test's $PROJ already has (team/

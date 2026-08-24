@@ -10,6 +10,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 RUN_DIR="$SKILL_DIR/run"
+# This starts the codex app-server and the bridge launcher, both of which
+# outlive it. The `3>&- 4>&-` on those spawn lines closes the two descriptors
+# we can name; the harness's is not one of them. See lib/close-fds.sh.
+# shellcheck source=../../../lib/close-fds.sh
+source "$SCRIPT_DIR/../../../lib/close-fds.sh"
+agmsg_close_inherited_fds
 # shellcheck source=../../../lib/hash.sh
 source "$SCRIPT_DIR/../../../lib/hash.sh"
 # shellcheck source=../../../lib/compat.sh
@@ -174,7 +180,12 @@ if [ -z "$PORT" ]; then
   # free of any Node dependency — only the bridge (codex-bridge.js) needs Node, and
   # it degrades on its own if Node is missing rather than taking down the TUI. See #170.
   : > "$SERVER_LOG"
-  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 &
+  # fds 3 and 4 are closed for the same reason remote.sh closes them around the
+  # sync engine: under bats, fd 3 is the TAP pipe, and a daemon that inherits it
+  # holds the whole test file open until the CI timeout. This app-server is
+  # built to outlive its caller -- that is what the pidfile and the reuse checks
+  # below are for -- so it is exactly the shape that keeps the pipe open.
+  "$REAL_CODEX" app-server --listen "ws://127.0.0.1:0" >>"$SERVER_LOG" 2>&1 3>&- 4>&- &
   server_bg="$!"
   echo "$server_bg" > "$SERVER_PID"
   # codex 0.144+ colorizes this banner even when stdout is a redirected file
@@ -224,7 +235,9 @@ export AGMSG_CODEX_BRIDGE_APP_SERVER="$SOCKET_URL"
 export AGMSG_CODEX_BRIDGE_LAUNCHER=1
 
 launcher_cmd="${AGMSG_CODEX_BRIDGE_LAUNCHER_CMD:-$SCRIPT_DIR/codex-bridge-launcher.sh}"
-"$launcher_cmd" codex "$PROJECT" "$SOCKET_URL" "$$" >/dev/null 2>&1 &
+# Same guard: the launcher is detached on purpose and outlives this script, so
+# an inherited fd 3 would outlive the test file that started it.
+"$launcher_cmd" codex "$PROJECT" "$SOCKET_URL" "$$" >/dev/null 2>&1 3>&- 4>&- &
 
 cd "$PROJECT"
 # Guard the array expansion: under bash 3.2 + `set -u`, "${CODEX_ARGS[@]}" on an

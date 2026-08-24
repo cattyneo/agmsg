@@ -23,8 +23,11 @@ source "$SCRIPT_DIR/lib/validate.sh"
 # never bypass team-name path safety.
 agmsg_validate_team_name "$TEAM" || exit 1
 
-DB="$(agmsg_db_path)"
+agmsg_storage_load
+DB="$(agmsg_db_path "$TEAM")"
 
+# Keep the full-schema bootstrap (registry + storage tables) for a first-ever
+# command; the message write itself goes through the storage facade below.
 [ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
 
 # #355: reject a from/to that isn't registered in <team> — an unnoticed typo
@@ -42,9 +45,9 @@ if [ "$FORCE" -ne 1 ]; then
       echo "Error: team '$TEAM' has no registered agents — cannot send as $role '$name' (use --force to bypass)." >&2
       return 1
     fi
-    local cfg_sql name_sql found roster
+    local cfg_sql name_sql found roster q="'"
     cfg_sql=$(agmsg_sql_readfile_path "$TEAM_CONFIG")
-    name_sql=$(printf '%s' "$name" | sed "s/'/''/g")
+    name_sql=${name//$q/$q$q}
     found=$(agmsg_sqlite_mem "
       WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
       cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw)
@@ -69,25 +72,11 @@ if [ "$FORCE" -ne 1 ]; then
   _agmsg_roster_check "to" "$TO" || exit 1
 fi
 
-# Escape EVERY interpolated value as a SQL string literal, not just body: a
-# team/agent name containing a single quote would otherwise break the INSERT
-# (correctness) or change its meaning (injection surface).
-_agmsg_sqlesc() { printf %s "$1" | sed "s/'/''/g"; }
-INSERT="INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('$(_agmsg_sqlesc "$TEAM")', '$(_agmsg_sqlesc "$FROM")', '$(_agmsg_sqlesc "$TO")', '$(_agmsg_sqlesc "$BODY")');"
-
-# Retry once after ensuring the schema. Under a concurrent first-write fan-out
-# (leader → N members against a fresh/override store), one process can see the
-# DB file exist before the winning initializer has finished creating the table,
-# so its INSERT would hit "no such table". init-db.sh is idempotent + uses the
-# busy_timeout, so re-running it waits for the schema, then the INSERT lands.
-# See #114.
-# Pipe the SQL via stdin (not as an argv) so a large body cannot overflow the
-# OS command-line limit (the "Argument list too long" crash).
-if ! printf '%s
-' "$INSERT" | agmsg_sqlite "$DB" 2>/dev/null; then
-  bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
-  printf '%s
-' "$INSERT" | agmsg_sqlite "$DB"
-fi
+# Write through the storage axis (§2.1 storage_send) — the active driver now owns
+# the message log (an append-only message_sent event), not a direct INSERT.
+# storage_send re-inits its schema idempotently before writing, which subsumes the
+# #114 concurrent first-write race the old path retried around (a process seeing
+# the DB file before the table exists just creates it). The new id is not surfaced.
+storage_send "$TEAM" "$FROM" "$TO" "$BODY" >/dev/null
 
 echo "Sent to $TO in team $TEAM"

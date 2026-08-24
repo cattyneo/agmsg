@@ -564,15 +564,43 @@ _doctor_scan_pair() {
   local _boring=0
   if [ "$_any_owner" -eq 0 ] \
     && [ "$_warn_count_after" -eq "$_warn_count_before" ] \
-    && [ "$_delivery_line_count" -le 1 ] && [ "$mode" = "off" ]; then
+    && case "$mode" in off\ \(unrecognized:*) false ;; off*) true ;; *) false ;; esac; then
     _boring=1
   fi
 
   _redact_project "$project"
+  # `off` and `off (unrecognized: …)` are not the same state, and only the first
+  # one is boring.
+  #
+  # `off` is a claim about the CONFIGURATION: the settings file was read and no
+  # delivery hooks are installed. Nothing to report.
+  #
+  # `unrecognized` is a claim about THIS CHECK: it could not find or parse the
+  # settings file, so it does not know what the configuration is. Collapsing that
+  # to "nothing to report" tells the operator their delivery is off when what
+  # happened is that we could not tell -- and the annotation it hides ("this
+  # project may not be registered") is the one that explains an empty inbox.
+  #
+  # Measured while merging: this branch's delivery.sh has no bare `off` at all --
+  # all four assignments carry an annotation -- so a condition testing for the
+  # bare word collapses nothing, and one testing the first word collapses
+  # everything including the three unrecognized cases.
   if [ "$_boring" -eq 1 ]; then
     local _noun="registrations"
     [ "$pair_count" -eq 1 ] && _noun="registration"
-    REPORT_BLOCKS="${REPORT_BLOCKS}$_REDACT_OUT  [$type]  $pair_count $_noun, nothing to report"$'\n'
+    # The path stays on the collapsed line. Of the five lines it replaces, four
+    # repeat what the summary already says (the mode, and "entries: 0" three
+    # times); the path answers a different question -- WHICH file was consulted.
+    # That is the difference between "looked and found nothing" and "did not
+    # look", and it is the distinction this repo keeps paying for when it goes
+    # missing.
+    _boring_conf="$(printf '%s\n' "$delivery_output" | sed -n 's/^settings hooks file: //p' | head -1)"
+    if [ -n "$_boring_conf" ]; then
+      _redact_text_out="$(_redact_text "$_boring_conf" "$project")"
+      REPORT_BLOCKS="${REPORT_BLOCKS}$_REDACT_OUT  [$type]  $pair_count $_noun, nothing to report — $_redact_text_out"$'\n'
+    else
+      REPORT_BLOCKS="${REPORT_BLOCKS}$_REDACT_OUT  [$type]  $pair_count $_noun, nothing to report"$'\n'
+    fi
   else
     REPORT_BLOCKS="${REPORT_BLOCKS}project: $_REDACT_OUT"$'\n'
     REPORT_BLOCKS="${REPORT_BLOCKS}type:    $type"$'\n\n'

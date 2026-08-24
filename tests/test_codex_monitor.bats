@@ -85,7 +85,7 @@ teardown() {
   # Handed off to a plain codex (no --remote bridge), preserving the args.
   grep -qx 'plain-codex <--foo>' "$CALL_LOG"
   # And it did NOT exec the bridged form.
-  ! grep -q -- '--remote' "$CALL_LOG"
+  refute grep -q -- '--remote' "$CALL_LOG"
   # The fallback is LOUD: the user is told real-time delivery is off.
   [[ "$output" == *"Real-time agmsg delivery is OFF"* ]]
 }

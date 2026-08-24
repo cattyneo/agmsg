@@ -61,6 +61,97 @@ EOF
   [[ "$output" =~ "Codex app-server bridge" ]]
 }
 
+# --- the log names who wrote each line (#784) ---------------------------
+#     The launcher appends this process's stderr to a per-identity log that has
+#     more than one writer by construction, and lines were reported spliced
+#     mid-word. Three things reach that file from the bridge and only one is a
+#     log record: diagnostics (ours, whole lines), the child app-server's own
+#     stderr (arbitrary chunks), and agent message deltas (partial by name).
+#     These pin what can be pinned from a POSIX machine: a diagnostic says who
+#     wrote it, it never continues someone else's half-line, and stdout is left
+#     alone.
+#
+#     `grep -q` rather than `[[ ]]` in the non-last positions: on bash 3.2,
+#     which is what macOS CI runs, a false `[[ ]]` there reports ok.
+
+@test "codex-bridge: every diagnostic line carries the pid that wrote it" {
+  # stderr only, so a prefix leaking into stdout cannot be mistaken for this
+  # passing. `2>&1 >/dev/null` in that order keeps stderr and drops stdout.
+  run bash -c 'node "$1" 2>&1 >/dev/null' _ "$TYPES/codex/codex-bridge.js"
+  [ "$status" -eq 1 ]
+  # `[<digits>] ` and then the message, on one line — the prefix is what makes
+  # a spliced line show two pids instead of reading as a single line.
+  printf '%s\n' "$output" | grep -qE '^\[[0-9]+\] codex-bridge: --project is required$'
+}
+
+@test "codex-bridge: a diagnostic never continues the half-line streamed output left open" {
+  # THE SHAPE #784 REPORTED, REACHED INSIDE ONE PROCESS. An agent message delta
+  # is partial by name, so it ends mid-word; before the funnel, the diagnostic
+  # that followed it landed on the same physical line and the record was
+  # unreadable without any second writer and without any platform question.
+  run bash -c 'node -e "
+    const { writeErr, logLine } = require(process.argv[1]);
+    writeErr(\"delta-ending-mid\");
+    logLine(\"codex-bridge: the diagnostic after it\");
+  " "$1" 2>&1 >/dev/null' _ "$TYPES/codex/codex-bridge.js"
+  [ "$status" -eq 0 ]
+  # The streamed bytes are unchanged and on their own line...
+  printf '%s\n' "$output" | grep -qx 'delta-ending-mid'
+  # ...and the diagnostic starts a line of its own, prefix first.
+  printf '%s\n' "$output" | grep -qE '^\[[0-9]+\] codex-bridge: the diagnostic after it$'
+  # `refute`, not `!`: a bare `! cmd` does not trip errexit on either bash.
+  refute grep -q 'delta-ending-midcodex-bridge' <<<"$output"
+}
+
+@test "codex-bridge: only one place writes to stderr, so the funnel cannot be bypassed" {
+  # The property above is only true while every write goes through `writeErr`.
+  # A future `process.stderr.write` added elsewhere would silently reopen the
+  # hole this test exists to close, so the count is pinned rather than the
+  # behaviour of the writers that exist today.
+  # Comment lines are stripped first: this file explains the funnel by naming
+  # `process.stderr.write` in prose, and counting those would make the check
+  # measure the commentary rather than the calls.
+  run bash -c "grep -v '^[[:space:]]*\(//\|\*\)' \"\$1\" | grep -c 'process\.stderr\.write'" _ "$TYPES/codex/codex-bridge.js"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+}
+
+@test "codex-bridge: a multi-byte character split across child stderr chunks survives byte-for-byte" {
+  # THROUGH THE PRODUCTION WIRING, not by calling the funnel directly: what is
+  # being pinned is that the child's stderr reaches the log undecoded, and only
+  # the real `child.stderr` handler can show that.
+  #
+  # The app-server writes a 3-byte character with the split INSIDE it, in two
+  # `data` events. Decoding each chunk on arrival — which an earlier revision of
+  # this change did — turns both halves into replacement characters and destroys
+  # the child's diagnostic. That is data loss the direct Buffer write it
+  # replaced did not have.
+  local fake="$TEST_SKILL_DIR/fake-split-utf8.js"
+  cat >"$fake" <<'EOF'
+const full = Buffer.from("日本語\n", "utf8");
+process.stderr.write(full.subarray(0, 4));       // ends mid-character
+setTimeout(() => {
+  process.stderr.write(full.subarray(4));
+  setTimeout(() => process.exit(0), 20);
+}, 20);
+EOF
+
+  AGMSG_CODEX_APP_SERVER_CMD="node $fake" run bash -c 'node "$1" --project "$2" --team team --name alice --timeout 1 --interval 1 --max-wakes 1 2>&1 >/dev/null' _ "$TYPES/codex/codex-bridge.js" "$PROJ"
+  printf '%s\n' "$output" | grep -q '日本語'
+  # `refute`, not `!`: a bare `! cmd` does not trip errexit on either bash.
+  refute grep -q $'\ufffd' <<<"$output"
+}
+
+@test "codex-bridge: stdout is NOT prefixed — it is an interface, not a diagnostic" {
+  # `--resolve-only`, the thread-id list and `usage()` are read by people and
+  # asserted by other tests here. Prefixing them would change a contract, so
+  # this fails if the prefix ever spreads to stdout.
+  run node "$TYPES/codex/codex-bridge.js" --help
+  [ "$status" -eq 0 ]
+  printf '%s\n' "${lines[0]}" | grep -q '^Usage:'
+  [[ ! "$output" =~ \[[0-9]+\]\  ]]
+}
+
 @test "codex-bridge: toPosixPath maps Windows drive paths to POSIX paths" {
   run node -e 'const { toPosixPath } = require(process.argv[1]); const expected = "/c/Users/me/OneDrive/codex-work"; if (toPosixPath(String.raw`C:\Users\me\OneDrive\codex-work`) !== expected) process.exit(1); if (toPosixPath("C:/Users/me/OneDrive/codex-work") !== expected) process.exit(1);' "$TYPES/codex/codex-bridge.js"
   [ "$status" -eq 0 ]
@@ -1717,4 +1808,189 @@ EOF
   [[ "$output" =~ "wakeup 2" ]]
   [[ "$output" =~ "started turn" ]]
   grep -q "turn/start" "$log"
+}
+
+# A WS app-server whose watch-once (process/spawn) exit codes are scripted by
+# $SCENARIO, so the bridge's re-arm accounting can be driven deterministically.
+# Shared by the two #936 tests below.
+_write_rearm_fake() {
+  cat >"$1" <<'EOF'
+const crypto = require("crypto"), fs = require("fs"), net = require("net");
+const [sock, logf] = process.argv.slice(2);
+const scenario = process.env.SCENARIO || "all124";
+try { fs.unlinkSync(sock); } catch (_) {}
+let arms = 0;
+function nextExit() {
+  if (scenario === "alt124_0") { const m = arms % 3; return m === 2 ? { code: 0, stdout: `status=pending count=1 max_id=${arms}\n` } : { code: 124, stdout: "" }; }
+  if (scenario === "flood0") return { code: 0, stdout: `status=pending count=1 max_id=${arms}\n` };
+  return { code: 124, stdout: "" };
+}
+function sendFrame(s, v) { const p = Buffer.from(JSON.stringify(v), "utf8"); let h; if (p.length < 126) h = Buffer.from([0x81, p.length]); else { h = Buffer.alloc(4); h[0]=0x81; h[1]=126; h.writeUInt16BE(p.length,2); } s.write(Buffer.concat([h, p])); }
+function handle(s, msg) {
+  if (msg.method === "initialize") return sendFrame(s, {jsonrpc:"2.0", id:msg.id, result:{}});
+  if (msg.method === "thread/resume") return sendFrame(s, {jsonrpc:"2.0", id:msg.id, result:{thread:{id:msg.params.threadId, status:{type:"idle"}}}});
+  if (msg.method === "turn/start") { sendFrame(s,{jsonrpc:"2.0",id:msg.id,result:{}}); setTimeout(()=>sendFrame(s,{jsonrpc:"2.0",method:"turn/completed",params:{threadId:msg.params.threadId,turn:{id:"t"}}}),5); return; }
+  if (msg.method === "process/spawn") { arms++; const { code, stdout } = nextExit(); fs.appendFileSync(logf, `${Date.now()} arm ${arms} exit ${code}\n`); sendFrame(s, {jsonrpc:"2.0", id:msg.id, result:{}}); setTimeout(()=>sendFrame(s,{jsonrpc:"2.0",method:"process/exited",params:{processHandle:msg.params.processHandle, exitCode:code, stdout, stderr:""}}), 5); return; }
+}
+function frames(s, st, chunk) { st.buffer = Buffer.concat([st.buffer, chunk]); while (st.buffer.length >= 2) { const op = st.buffer[0] & 0x0f; let len = st.buffer[1] & 0x7f; let off = 2; if (len === 126) { if (st.buffer.length < off+2) return; len = st.buffer.readUInt16BE(off); off+=2; } else if (len === 127) { if (st.buffer.length < off+8) return; len = st.buffer.readUInt32BE(off+4); off+=8; } const masked = (st.buffer[1] & 0x80) !== 0; const mo = off; if (masked) off += 4; if (st.buffer.length < off+len) return; let pl = st.buffer.slice(off, off+len); if (masked) { const mk = st.buffer.slice(mo, mo+4); pl = Buffer.from(pl.map((b,i)=>b^mk[i%4])); } st.buffer = st.buffer.slice(off+len); if (op === 0x1) handle(s, JSON.parse(pl.toString("utf8"))); } }
+const server = net.createServer((s) => { const st = { buffer: Buffer.alloc(0), upgraded: false, header: Buffer.alloc(0) }; s.on("data", (chunk) => { if (!st.upgraded) { st.header = Buffer.concat([st.header, chunk]); const end = st.header.indexOf("\r\n\r\n"); if (end === -1) return; const hdr = st.header.slice(0,end).toString("utf8"); const rest = st.header.slice(end+4); const key = (hdr.match(/Sec-WebSocket-Key: (.*)\r\n/i)||[])[1].trim(); const acc = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64"); s.write(["HTTP/1.1 101 Switching Protocols","Upgrade: websocket","Connection: Upgrade",`Sec-WebSocket-Accept: ${acc}`,"",""].join("\r\n")); st.upgraded = true; if (rest.length) frames(s, st, rest); return; } frames(s, st, chunk); }); s.on("close", () => server.close(()=>process.exit(0))); });
+server.listen(sock);
+EOF
+}
+
+@test "codex-bridge: the failure cap reaches even when wakes interleave (#936)" {
+  run node -e 'const net=require("net"),crypto=require("crypto");if(!net||!crypto)process.exit(1);'
+  [ "$status" -eq 0 ] || skip "node net/crypto not available"
+  run node -e 'const fs=require("fs"),net=require("net");const s=process.argv[1];try{fs.unlinkSync(s)}catch(_){}const sv=net.createServer();sv.on("error",()=>process.exit(2));sv.listen(s,()=>sv.close(()=>{try{fs.unlinkSync(s)}catch(_){}process.exit(0)}));' "$TEST_SKILL_DIR/probe3.sock"
+  [ "$status" -eq 0 ] || skip "unix socket listen not available"
+
+  local fake="$TEST_SKILL_DIR/rearm-fake.js" sock="$TEST_SKILL_DIR/rearm.sock" flog="$TEST_SKILL_DIR/rearm.log"
+  _write_rearm_fake "$fake"; : > "$flog"
+  SCENARIO=alt124_0 node "$fake" "$sock" "$flog" 3>&- &
+  local server_pid="$!"
+  for _ in {1..50}; do [ -S "$sock" ] && break; sleep 0.1; done
+
+  # fail, fail, wake, repeating: the old reset-to-0 held the counter below the
+  # limit forever. With the decay it climbs, so the bridge stops itself.
+  run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --thread thread-x \
+    --app-server "unix://$sock" --timeout 1 --interval 1
+  kill "$server_pid" 2>/dev/null || true
+
+  [ "$status" -ne 0 ]
+  grep -q "stopping after" <<<"$output"
+  grep -q "consecutive watch-once failure" <<<"$output"
+}
+
+@test "codex-bridge: a flood of distinct wakes is rate-limited, not a re-arm storm (#936)" {
+  run node -e 'const net=require("net"),crypto=require("crypto");if(!net||!crypto)process.exit(1);'
+  [ "$status" -eq 0 ] || skip "node net/crypto not available"
+  run node -e 'const fs=require("fs"),net=require("net");const s=process.argv[1];try{fs.unlinkSync(s)}catch(_){}const sv=net.createServer();sv.on("error",()=>process.exit(2));sv.listen(s,()=>sv.close(()=>{try{fs.unlinkSync(s)}catch(_){}process.exit(0)}));' "$TEST_SKILL_DIR/probe4.sock"
+  [ "$status" -eq 0 ] || skip "unix socket listen not available"
+
+  local fake="$TEST_SKILL_DIR/rearm-fake2.js" sock="$TEST_SKILL_DIR/rearm2.sock" flog="$TEST_SKILL_DIR/rearm2.log"
+  _write_rearm_fake "$fake"; : > "$flog"
+  SCENARIO=flood0 node "$fake" "$sock" "$flog" 3>&- &
+  local server_pid="$!"
+  for _ in {1..50}; do [ -S "$sock" ] && break; sleep 0.1; done
+
+  # Every watch-once returns a wake with a fresh max_id, so the stale-wake guard
+  # never fires and this would re-arm with no delay. Let it run ~6 s, then stop.
+  node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --thread thread-x \
+    --app-server "unix://$sock" --timeout 1 --interval 1 >/dev/null 2>&1 3>&- &
+  local bpid="$!"
+  sleep 6
+  kill "$bpid" 2>/dev/null || true; wait "$bpid" 2>/dev/null || true
+  kill "$server_pid" 2>/dev/null || true
+
+  # The 1 s floor caps this near one arm per second. Without it the same 6 s
+  # produced hundreds. Assert a generous ceiling so the test is not timing-flaky
+  # but still fails a regression to the unbounded loop.
+  local arms
+  arms="$(grep -c ' arm ' "$flog")"
+  [ "$arms" -ge 1 ]
+  [ "$arms" -le 20 ]
+}
+@test "codex-bridge: a thread owned by another writer is fatal, not proceed-without-resume (#906)" {
+  run node -e 'const net = require("net"); const crypto = require("crypto"); if (!net || !crypto) process.exit(1);'
+  if [ "$status" -ne 0 ]; then
+    skip "node net/crypto modules are not available in this sandbox"
+  fi
+  run node -e 'const fs = require("fs"); const net = require("net"); const sock = process.argv[1]; try { fs.unlinkSync(sock); } catch (_) {} const server = net.createServer(); server.on("error", () => process.exit(2)); server.listen(sock, () => server.close(() => { try { fs.unlinkSync(sock); } catch (_) {} process.exit(0); }));' "$TEST_SKILL_DIR/probe2.sock"
+  if [ "$status" -ne 0 ]; then
+    skip "unix socket listen is not available in this sandbox"
+  fi
+
+  local fake="$TEST_SKILL_DIR/fake-writer-owned.js"
+  local sock="$TEST_SKILL_DIR/fake-writer-owned.sock"
+  local log="$TEST_SKILL_DIR/fake-writer-owned.log"
+  # A minimal WS app-server that answers thread/resume with the deterministic
+  # "already has an active writer" JSON-RPC error. process/spawn is deliberately
+  # NOT handled: a correct bridge dies before it ever arms a watcher.
+  cat >"$fake" <<'EOF'
+const crypto = require("crypto");
+const fs = require("fs");
+const net = require("net");
+const sock = process.argv[2];
+const log = process.argv[3];
+try { fs.unlinkSync(sock); } catch (_) {}
+function sendFrame(socket, value) {
+  const payload = Buffer.from(JSON.stringify(value), "utf8");
+  let header;
+  if (payload.length < 126) { header = Buffer.from([0x81, payload.length]); }
+  else { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(payload.length, 2); }
+  socket.write(Buffer.concat([header, payload]));
+}
+function handleMessage(socket, message) {
+  fs.appendFileSync(log, `${message.method}\n`);
+  if (message.method === "initialize") {
+    sendFrame(socket, { jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/resume") {
+    sendFrame(socket, {
+      jsonrpc: "2.0",
+      id: message.id,
+      error: { code: -32600, message: `thread ${message.params.threadId} already has an active writer (code -32600)` },
+    });
+  }
+}
+function parseFrames(socket, state, chunk) {
+  state.buffer = Buffer.concat([state.buffer, chunk]);
+  while (state.buffer.length >= 2) {
+    const opcode = state.buffer[0] & 0x0f;
+    let length = state.buffer[1] & 0x7f;
+    let offset = 2;
+    if (length === 126) { if (state.buffer.length < offset + 2) return; length = state.buffer.readUInt16BE(offset); offset += 2; }
+    else if (length === 127) { if (state.buffer.length < offset + 8) return; length = state.buffer.readUInt32BE(offset + 4); offset += 8; }
+    const masked = (state.buffer[1] & 0x80) !== 0;
+    const maskOffset = offset;
+    if (masked) offset += 4;
+    if (state.buffer.length < offset + length) return;
+    let payload = state.buffer.slice(offset, offset + length);
+    if (masked) { const mask = state.buffer.slice(maskOffset, maskOffset + 4); payload = Buffer.from(payload.map((b, i) => b ^ mask[i % 4])); }
+    state.buffer = state.buffer.slice(offset + length);
+    if (opcode === 0x1) handleMessage(socket, JSON.parse(payload.toString("utf8")));
+  }
+}
+const server = net.createServer((socket) => {
+  const state = { buffer: Buffer.alloc(0), upgraded: false, header: Buffer.alloc(0) };
+  socket.on("data", (chunk) => {
+    if (!state.upgraded) {
+      state.header = Buffer.concat([state.header, chunk]);
+      const end = state.header.indexOf("\r\n\r\n");
+      if (end === -1) return;
+      const header = state.header.slice(0, end).toString("utf8");
+      const rest = state.header.slice(end + 4);
+      const key = (header.match(/Sec-WebSocket-Key: (.*)\r\n/i) || [])[1].trim();
+      const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+      socket.write(["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", `Sec-WebSocket-Accept: ${accept}`, "", ""].join("\r\n"));
+      state.upgraded = true;
+      if (rest.length > 0) parseFrames(socket, state, rest);
+      return;
+    }
+    parseFrames(socket, state, chunk);
+  });
+  socket.on("close", () => server.close(() => process.exit(0)));
+});
+server.listen(sock);
+EOF
+
+  node "$fake" "$sock" "$log" 3>&- &
+  local server_pid="$!"
+  for _ in {1..50}; do [ -S "$sock" ] && break; sleep 0.1; done
+
+  run node "$TYPES/codex/codex-bridge.js" \
+    --project "$PROJ" --team team --name alice --thread thread-owned-elsewhere \
+    --app-server "unix://$sock" --timeout 1 --interval 1 --max-wakes 1
+
+  kill "$server_pid" 2>/dev/null || true
+
+  # The bridge exits non-zero, says why, and NEVER armed a watcher: a bridge
+  # that cannot own its thread is exactly what accumulates in #906.
+  [ "$status" -ne 0 ]
+  grep -q "already has an active writer" <<<"$output"
+  [ "$(grep -c "codex-bridge: armed" <<<"$output")" -eq 0 ]
+  [ "$(grep -c "proceeding without resume" <<<"$output")" -eq 0 ]
+  grep -q "thread/resume" "$log"
+  ! grep -q "process/spawn" "$log"
 }

@@ -377,25 +377,25 @@ gone_pid() {
 }
 
 @test "args_is_grok_watcher: matches a real watcher invocation (#245)" {
-  local proj="/Users/x/projects/comms-agent"
+  local proj="/Users/x/projects/notes-app"
   agmsg_args_is_grok_watcher "bash /skills/agmsg/scripts/watch.sh sess.1 $proj grok-build" "$proj"
 }
 
 @test "args_is_grok_watcher: matches an empty-sid watcher (double space) (#245)" {
-  local proj="/Users/x/projects/comms-agent"
+  local proj="/Users/x/projects/notes-app"
   agmsg_args_is_grok_watcher "bash /skills/agmsg/scripts/watch.sh  $proj grok-build" "$proj"
 }
 
 @test "args_is_grok_watcher: excludes a shell that merely mentions the strings (#245)" {
   # A process running `grep watch.sh ... grok-build` would be wrongly killed by a
   # loose substring match. watch.sh is not the executed program here.
-  local proj="/Users/x/projects/comms-agent"
+  local proj="/Users/x/projects/notes-app"
   run agmsg_args_is_grok_watcher "/bin/zsh -c grep watch.sh foo grok-build $proj" "$proj"
   [ "$status" -ne 0 ]
 }
 
 @test "args_is_grok_watcher: excludes a watcher for a different project (#245)" {
-  run agmsg_args_is_grok_watcher "bash /s/watch.sh sess.1 /other/proj grok-build" "/Users/x/comms-agent"
+  run agmsg_args_is_grok_watcher "bash /s/watch.sh sess.1 /other/proj grok-build" "/Users/x/notes-app"
   [ "$status" -ne 0 ]
 }
 

@@ -69,7 +69,7 @@ settings_file() {
 @test "delivery set off: removes both hooks" {
   bash "$SCRIPTS/delivery.sh" set both claude-code "$TEST_PROJECT"
   bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
-  ! has_session_start "$(settings_file)"
+  refute has_session_start "$(settings_file)"
   ! has_check_inbox "$(settings_file)"
 }
 
@@ -113,7 +113,7 @@ settings_file() {
 @test "delivery: both -> off clears settings.local.json hooks" {
   bash "$SCRIPTS/delivery.sh" set both claude-code "$TEST_PROJECT"
   bash "$SCRIPTS/delivery.sh" set off  claude-code "$TEST_PROJECT"
-  ! has_session_start "$(settings_file)"
+  refute has_session_start "$(settings_file)"
   ! has_check_inbox "$(settings_file)"
 }
 
@@ -222,9 +222,53 @@ eperm_pid() {
   [[ "$output" =~ "mode: turn" ]]
 }
 
-@test "delivery status: derives 'off' from settings with no agmsg hooks" {
+@test "delivery status: a settings file with zero agmsg hooks reads as 'no hooks installed', not asserted-deliberate (#687 review round 3)" {
+  # $TEST_PROJECT's settings file exists and is real, just empty of agmsg
+  # entries -- but `set off`'s apply_default only STRIPS agmsg's own hook
+  # entries, it writes no marker recording that `set off` ran. So this exact
+  # byte state is reachable two ways: someone ran `set off`, or this project
+  # simply never had agmsg configured. delivery.sh cannot tell those apart,
+  # so the wording must not claim "deliberate" -- it states only what's
+  # observable (hooks absent), distinct from the "(unrecognized: ...)" family
+  # the next two tests check for, which means delivery.sh couldn't even read
+  # a settings file at all.
+  bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT" >/dev/null
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
-  [[ "$output" =~ "mode: off" ]]
+  [[ "$output" == "mode: off (no agmsg delivery hooks installed for this project)"$'\n'* ]] || { echo "expected the first line to be exactly 'mode: off (no agmsg delivery hooks installed for this project)', got: $output" >&2; return 1; }
+  [[ "$output" != *"unrecognized"* ]]
+}
+
+@test "delivery status: an unrecognized project is distinguishable from a deliberately off one (#687)" {
+  # No `set` call at all: $TEST_PROJECT is a bare mktemp -d, so no settings
+  # file exists at the resolved path -- the actual #684 failure mode, where
+  # a settings file could not be found (most often because the caller's
+  # $(pwd) did not match how the project was actually registered) and that
+  # was reported as indistinguishable from a real, deliberate "off". Both
+  # used to print the bare word "off"; the FIRST line has to differ now, not
+  # just a later one, because a reader (or actas) that only looks at the
+  # first line must still be able to tell.
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [[ "$output" == "mode: off ("*")"$'\n'* || "$output" == "mode: off ("*")" ]] \
+    || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
+  [[ "$output" == *"unrecognized"* ]] &&
+    [[ "$output" == *"$TEST_PROJECT"* ]]
+}
+
+@test "delivery status: a settings file that exists but is not valid JSON is also unrecognized, not deliberate off (review)" {
+  # A third way has_ss/has_st both land on 0: not "missing" and not "genuinely
+  # empty of agmsg entries" but unreadable/malformed, which the has_ss/has_st
+  # queries collapse to the same 0 a real off produces (`2>/dev/null ||
+  # echo 0`) -- checking only file EXISTENCE, as the first #687 fix did,
+  # missed this: a corrupt settings file still read as a deliberate,
+  # confirmed off. Reproducing what a hand-edited or partially-written
+  # settings.local.json looks like.
+  mkdir -p "$TEST_PROJECT/.claude"
+  printf '{not valid json' > "$TEST_PROJECT/.claude/settings.local.json"
+  run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
+  [[ "$output" == "mode: off ("*")"$'\n'* || "$output" == "mode: off ("*")" ]] \
+    || { echo "expected the first line to read 'mode: off (...)', got: $output" >&2; return 1; }
+  [[ "$output" == *"unrecognized"* ]] &&
+    [[ "$output" == *"could not be read as valid JSON"* ]]
 }
 
 # --- rejects unknown mode ---
@@ -447,6 +491,167 @@ eperm_pid() {
   [ "$3" = "$sp" ]
 }
 
+@test "session-start: a connected team with no engine is started, and said when that fails (#761, #774)" {
+  # A reboot kills every sync engine and nothing restarts one. `connected` keeps
+  # printing and `send` keeps succeeding locally, so the only symptom is silence
+  # — which reads as "nobody wrote anything". This hook is the first thing of
+  # ours that runs afterwards.
+  #
+  # A RULING WAS REVERSED HERE, and this test is where it is recorded.
+  #
+  # #761/#765 decided: do NOT start anything, make the absence VISIBLE. That
+  # decision is what this test was written to hold. #774 reverses it — an agent
+  # arriving at a connected team now STARTS the engine — on the grounds that
+  # visibility asks a person for something the machine can do.
+  #
+  # What #765 built is not discarded: its warning, its wording and its runnable
+  # remedy are exactly what remains when the start FAILS, and that is the case
+  # driven below. The assertions about what the operator is told are therefore
+  # unchanged; only the reason they are reachable is new. This is a reversal of
+  # a decision, not a test edited to fit new output (raised in review).
+  #
+  # THE FAILURE IS FORCED BY THE COMMAND ITSELF, not by its environment.
+  #
+  # It used to be forced with an unusable interpreter, on the reasoning that
+  # `sync start` would then "fail immediately and for a named reason". That is
+  # a claim about a machine, and it was false on one: on a macOS CI runner the
+  # command had not returned after SIXTY seconds, so the hook printed "a start
+  # is still in flight" — a different fact, tested elsewhere — and this case
+  # failed for a reason that had nothing to do with what it asserts.
+  #
+  # So `remote.sh` is replaced, for this half of the test, by one that answers
+  # `status` with a connected team and refuses `sync start` at once. The real
+  # one is restored before the section below, which needs it to SUCCEED.
+  #
+  # It used to be inherited instead — the fixture simply had no engine to start
+  # — and that held only while this file ran alone: the case passed under
+  # `--filter` and failed in the full file, because what a start does depends on
+  # what other tests left behind. That is the same cross-test coupling this PR
+  # fixes in its own suite, arriving from the other direction. The condition is
+  # stated here so nothing about the surrounding file can decide it.
+  #
+  # The budget is raised as well: under the 5s default a slow failure is
+  # reported as "still in flight", which is a different fact and is tested
+  # separately in tests/test_sync_autostart.bats.
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+
+  # NEGATIVE FIRST, on the state every ordinary machine is in: no connected
+  # team at all. A line printed unconditionally would pass the positive half
+  # below and be wrong every single session.
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  [ "$status" -eq 0 ]
+  refute grep -qF -- "connected, but not syncing" <<<"$output"
+
+  # Now a connected team whose engine is not running. Written through the same
+  # config the command reads, rather than by calling `connect` — no server here.
+  local cfg="$TEST_SKILL_DIR/teams/team/config.json" updated escaped
+  escaped="$(sed "s/'/''/g" "$cfg")"
+  updated="$(sqlite_mem "
+    SELECT json_set('$escaped', '\$.remote_binding', json_object(
+      'endpoint', 'https://remote.example',
+      'server_instance_id', '018f0000-0000-7000-8000-000000000001',
+      'remote_team_id', '018f0000-0000-7000-8000-000000000002',
+      'protocol_version', 1,
+      'capabilities', json_object('write_allowed_ciphers', json_array('none')),
+      'connected_at', '2026-08-12T00:00:00Z',
+      'disconnected_at', null
+    ));")"
+  printf '%s\n' "$updated" > "$cfg"
+
+  # The stub goes in HERE, after the negative half has run against the real
+  # command. Installed any earlier it would report a connected team before one
+  # exists, and the negative assertion — the one that catches a line printed
+  # unconditionally — would be testing the stub instead of the hook.
+  cp "$SCRIPTS/remote.sh" "$TEST_SKILL_DIR/remote.real.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'if [ "${1:-}" = "status" ] && [ -z "${2:-}" ]; then'
+    printf '%s\n' '  printf "team\tconnected since 2026-08-12\n"; exit 0'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'if [ "${1:-}" = "sync" ]; then'
+    printf '%s\n' '  echo "agmsg: cannot start the sync engine for '"'"'$3'"'"': no runtime" >&2; exit 1'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'exit 0'
+  } > "$SCRIPTS/remote.sh"
+  chmod +x "$SCRIPTS/remote.sh"
+
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | grep -q -F -- "connected, but not syncing"
+  # The printed COMMAND must be runnable, not a template. Scoped to the command
+  # lines: the Monitor directive below legitimately contains `<team>` when it
+  # describes the message format `<ts> | <team> | <from> → <to> | <body>`, and a
+  # whole-output match calls that a defect. Measured — the first version of this
+  # assertion failed on exactly that line.
+  # Saved BEFORE the next `run`, which replaces $output. Asserting on $output
+  # after running the suggested command reads the command's output and calls it
+  # the hook's — measured here, it turned a passing check into a failing one for
+  # the wrong reason.
+  local session_out="$output" suggested
+  suggested="$(printf '%s\n' "$session_out" | sed -n 's/^  bash //p' | head -1)"
+  [ -n "$suggested" ]
+  refute grep -qF -- "<team>" <<<"$suggested"
+
+  # The directive still has to be there: a warning that displaces it would stop
+  # the session receiving anything at all, which is worse than the gap it names.
+  printf '%s\n' "$session_out" | grep -q -F -- "invoke the Monitor tool"
+
+  # The real command is back from here on: the rest of this test requires a
+  # `sync start` that can succeed, and a stub that always refuses would make
+  # the final assertion unreachable rather than true.
+  cp "$TEST_SKILL_DIR/remote.real.sh" "$SCRIPTS/remote.sh"
+  chmod +x "$SCRIPTS/remote.sh"
+
+  # Run what was printed, THROUGH AN INSTALL PATH THAT NEEDS QUOTING, and
+  # require it to succeed.
+  #
+  # The first version of this checked only that `Usage:` was absent, and never
+  # looked at `$status` — so `bash: …: No such file or directory` would have
+  # passed it. And the fixture's install path had no space in it, so dropping
+  # `%q` from the path changed nothing: the test could not fail for the reason
+  # it was written. Both raised in review, both true.
+  # A COPY, not a symlink. `SKILL_DIR` is `cd "$SCRIPT_DIR/.." && pwd`, and `..`
+  # resolves through a symlink to the physical parent — so a symlinked install
+  # with a space in its name arrives here as the real path without one, and the
+  # fixture would silently stop testing what it was built for. Measured.
+  local spaced="$BATS_TEST_TMPDIR/an install/skill"
+  mkdir -p "$spaced"
+  cp -R "$TEST_SKILL_DIR/." "$spaced/"
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$spaced/scripts/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  [ "$status" -eq 0 ]
+  local spaced_cmd
+  spaced_cmd="$(printf '%s\n' "$output" | sed -n 's/^  bash //p' | head -1)"
+  [ -n "$spaced_cmd" ]
+  # `install`, not `an install`: %q escapes the space, so the literal phrase is
+  # never present in a correctly quoted line. Checking for it asserts the
+  # ABSENCE of the quoting this test exists to require — measured, it failed
+  # against a correct implementation twice.
+  printf '%s\n' "$spaced_cmd" | grep -q -F -- "install"
+
+  # A fake engine, so success is reachable at all: without one the command runs
+  # correctly and still exits non-zero with `sync engine … did not become ready`,
+  # and a test that accepted that would be accepting the failure it is meant to
+  # catch.
+  local fake_node="$BATS_TEST_TMPDIR/fake-node"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "${1:-}" = "--version" ]; then echo v23.0.0; exit 0; fi' \
+    'echo "{\"event\":\"capabilities\",\"startup_nonce\":\"${AGMSG_SYNC_START_NONCE:-}\"}"' \
+    'trap "exit 0" TERM INT' \
+    'while :; do sleep 1; done' > "$fake_node"
+  chmod +x "$fake_node"
+
+  run env AGMSG_RESOLVE_PROJECT=0 AGMSG_NODE="$fake_node" bash -c "bash $spaced_cmd"
+  # The STATUS, not the absence of one string. An unquoted path fails here with
+  # `No such file or directory` and a non-zero exit, and the earlier version of
+  # this check — `refute grep Usage:` — passed on exactly that.
+  [ "$status" -eq 0 ]
+  local started_pid
+  started_pid="$(cat "$spaced/run/remote-sync.team.pid" 2>/dev/null || true)"
+  [ -n "$started_pid" ]
+  ENGINE_PIDS="${ENGINE_PIDS:+$ENGINE_PIDS }$started_pid"
+  kill "$started_pid" 2>/dev/null || true
+}
+
 # --- session-start.sh role-aware resume directive (#339) ---
 
 # Write a role-session record into the isolated skill dir's run/.
@@ -525,13 +730,13 @@ _seed_role_record() {
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-test.pid"
+  sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 1 watch" ]]
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   [ ! -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
-  wait_for_pid_exit "$watch_pid"
+  sleep 1
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -578,7 +783,7 @@ JSON
   # A live claude-code watcher for this project.
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess.pid"
+  sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
   # Switching a DIFFERENT type's delivery in the SAME project must not touch it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
@@ -596,12 +801,12 @@ JSON
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess2.pid"
+  sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
-  wait_for_pid_exit "$watch_pid"
+  sleep 1
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -618,7 +823,7 @@ JSON
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code 3>&- &
   local watch_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.sp-sess.pid"
+  sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
   # Another type's set turn in the SAME space-containing project: must NOT kill it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$sp"
@@ -629,7 +834,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$sp"
   [ "$status" -eq 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
-  wait_for_pid_exit "$watch_pid"
+  sleep 1
   ! kill -0 "$watch_pid" 2>/dev/null
 }
 
@@ -644,11 +849,11 @@ JSON
 
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code 3>&- &
   local pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.sigterm-test.pid"
+  sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
   kill -TERM "$pid"
-  wait_for_pid_exit "$pid"
-  ! kill -0 "$pid" 2>/dev/null
+  sleep 1
+  refute kill -0 "$pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
 }
 
@@ -727,7 +932,7 @@ JSON
   [ -f "$pidfile" ]
   prev_p=$(cat "$pidfile")
   kill "$prev_p"
-  wait_for_pid_exit "$prev_p"
+  sleep 1
   ! kill -0 "$prev_p" 2>/dev/null
 }
 
@@ -828,23 +1033,23 @@ has_session_end() {
 # --- session-end.sh behavior ---
 
 @test "session-end.sh kills the watcher matching session_id and removes pidfile" {
-  # The fixture must be a REAL watcher. session-end.sh only kills a pid whose
-  # command line still looks like watch.sh (pid-recycling safety, see its
-  # comment), so the `sleep 30` stand-in this used to launch could never be
-  # killed — and the assertion passed anyway, so the test never checked what its
-  # name claims. Converting the wait to a poll is what surfaced it: polling
-  # reports the process is still there, where the single post-sleep check did
-  # not.
-  mkdir -p "$TEST_SKILL_DIR/teams/myteam"
-  cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
-{"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
-JSON
-  AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sess-A "$TEST_PROJECT" claude-code 3>&- &
-  local target_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.sess-A.pid"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # The cmdline has to look like this install's watch.sh: session-end only
+  # signals a pid that still does, so a bare `sleep` was never killed and the
+  # check for it was silent (#670).
+  local target_pid
+  spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; target_pid="$DECOY_PID"
+  # The fixture's own preconditions, before the action. Without them this test
+  # cannot refuse the false green it exists to fix: the first helper spawned the
+  # decoy inside `$( )`, it died with the subshell, and "the watcher was killed"
+  # passed because nothing was ever alive to kill.
+  kill -0 "$target_pid" 2>/dev/null || { echo "the decoy was not alive" >&2; return 1; }
+  _decoy_cmdline "$target_pid" | grep -q -F -- "$SCRIPTS/watch.sh" \
+    || { echo "the decoy does not look like this install's watch.sh" >&2; return 1; }
+  echo "$target_pid" > "$TEST_SKILL_DIR/run/watch.sess-A.pid"
   echo '{"session_id":"sess-A"}' | bash "$SCRIPTS/session-end.sh" claude-code "$TEST_PROJECT"
-  wait_for_pid_exit "$target_pid"
-  ! kill -0 "$target_pid" 2>/dev/null
+  sleep 1
+  refute kill -0 "$target_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sess-A.pid" ]
 }
 
@@ -877,8 +1082,11 @@ JSON
 @test "delivery set monitor: bakes CLAUDE_CODE_SESSION_ID into the directive" {
   CLAUDE_CODE_SESSION_ID="real-uuid-1234" run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [[ "$output" =~ "real-uuid-1234" ]]
-  ! [[ "$output" =~ "\\\$AGMSG_SESSION_ID" ]]
-  ! [[ "$output" =~ "\\\$CLAUDE_CODE_SESSION_ID" ]]
+  # A quoted right-hand side in `[[ =~ ]]` is a literal, so `grep -F` matches
+  # the same thing -- including the backslash: what must be absent is the
+  # ESCAPED form `\$NAME`, not an expanded one. `! [[ ]]` never fired (#670).
+  refute grep -q -F -- '\$AGMSG_SESSION_ID' <<<"$output"
+  refute grep -q -F -- '\$CLAUDE_CODE_SESSION_ID' <<<"$output"
 }
 
 @test "delivery set monitor: falls back to a generated id when env is unset" {
@@ -887,7 +1095,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
   # No placeholder leaked
-  ! [[ "$output" =~ "\\\$AGMSG_SESSION_ID" ]]
+  refute grep -q -F -- '\$AGMSG_SESSION_ID' <<<"$output"
 }
 
 # --- session-start.sh: stale watcher pidfile cleanup ---
@@ -998,7 +1206,7 @@ JSON
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "already streaming" ]]
-  ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
+  refute grep -q -F -- 'AGMSG-DIRECTIVE' <<<"$output"
 
   kill "$live_pid" 2>/dev/null || true
   unset CLAUDE_CODE_SESSION_ID
@@ -1028,7 +1236,7 @@ JSON
     bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "already streaming" ]]
-  ! [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
+  refute grep -q -F -- 'AGMSG-DIRECTIVE' <<<"$output"
 
   kill "$live_pid" 2>/dev/null || true
   unset CLAUDE_CODE_SESSION_ID
@@ -1292,18 +1500,13 @@ JSON
 
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 3>&- &
   local pid=$!
-  # High-water-mark = MAX(id) at startup, so prior messages aren't replayed.
-  # The watermark file is written the moment that mark is taken, so waiting for
-  # it — rather than a fixed second — is what actually makes the inserts below
-  # land after the mark.
-  wait_for_file "$TEST_SKILL_DIR/run/watch.t-sid.watermark"
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'alice', 'new-for-alice');"
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'new-for-bob');"
-  # new-for-bob is the LAST row inserted, so by the time it has been delivered
-  # the watcher has necessarily scanned past new-for-alice. That is what makes
-  # the "alice never arrived" assertion below a real check; the fixed `sleep 3`
-  # it replaces only assumed enough poll iterations had gone by.
-  wait_for_file_contains /tmp/agmsg-as-bob "new-for-bob"
+  # The watcher seeds its cursor from the storage tip at startup, so prior
+  # messages aren't replayed. Send NEW messages through the facade (storage_send
+  # writes the event log the watcher now streams) and wait for several polls.
+  sleep 1
+  bash "$SCRIPTS/send.sh" myteam system alice "new-for-alice" --force >/dev/null
+  bash "$SCRIPTS/send.sh" myteam system bob "new-for-bob" --force >/dev/null
+  sleep 3
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
@@ -1331,9 +1534,14 @@ JSON
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
 
-  # Orphan: watcher referenced by a cc-instance.<dead-pid> file.
-  sleep 30 3>&- &
-  local orphan_pid=$!
+  # Orphan: watcher referenced by a cc-instance.<dead-pid> file. Its cmdline
+  # has to look like watch.sh or the reaper declines to signal it (#670).
+  local orphan_pid
+  spawn_decoy_with_cmdline "$SCRIPTS/watch.sh"; orphan_pid="$DECOY_PID"
+  # Same preconditions, same reason.
+  kill -0 "$orphan_pid" 2>/dev/null || { echo "the decoy was not alive" >&2; return 1; }
+  _decoy_cmdline "$orphan_pid" | grep -q -F -- "$SCRIPTS/watch.sh" \
+    || { echo "the decoy does not look like this install's watch.sh" >&2; return 1; }
   echo "$orphan_pid" > "$TEST_SKILL_DIR/run/watch.orphan-sid.pid"
   # Use a PID that's almost certainly not in use as the dead CC ancestor.
   local dead_cc_pid=999999
@@ -1348,7 +1556,7 @@ JSON
   echo "{\"session_id\":\"current-sid\"}" \
     | bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" >/dev/null
 
-  ! kill -0 "$orphan_pid" 2>/dev/null
+  refute kill -0 "$orphan_pid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.orphan-sid.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/cc-instance.$dead_cc_pid" ]
   # Untracked watcher untouched
@@ -1395,28 +1603,22 @@ JSON
   # is resolved at launch and not re-evaluated each poll.
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 3>&- &
   local pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.t-static.watermark"
+  sleep 1
 
   # Join `bob` to the same (project, type) after the watcher is running.
   bash "$SCRIPTS/join.sh" myteam bob claude-code "$TEST_PROJECT"
 
-  # Insert messages for both. alice should arrive (alice was in the original
-  # subscription set); bob should NOT arrive (joined after launch).
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'for-alice-static');"
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'bob',   'for-bob-static');"
+  # Send messages for both via the facade. alice should arrive (alice was in the
+  # original subscription set); bob should NOT arrive (joined after launch).
+  bash "$SCRIPTS/send.sh" myteam sys alice "for-alice-static" --force >/dev/null
+  bash "$SCRIPTS/send.sh" myteam sys bob   "for-bob-static" --force >/dev/null
 
-  # A sentinel for alice inserted AFTER bob's row. Its arrival proves the
-  # watcher has already scanned past for-bob-static, which is what makes "bob
-  # never arrived" an assertion rather than a guess. Waiting on
-  # for-alice-static instead would not: it precedes bob's row, so seeing it
-  # says nothing about whether bob's had been reached yet.
-  sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'sys', 'alice', 'static-sentinel');"
-  wait_for_file_contains /tmp/agmsg-static "static-sentinel"
+  sleep 3
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
   grep -q "for-alice-static" /tmp/agmsg-static
-  ! grep -q "for-bob-static" /tmp/agmsg-static
+  refute grep -q "for-bob-static" /tmp/agmsg-static
   rm -f /tmp/agmsg-static
 }
 
@@ -1440,17 +1642,16 @@ JSON
   local pid_a=$!
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-a.pid"
-  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-b.pid"
+  sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
   [ -f "$TEST_SKILL_DIR/run/watch.sid-b.pid" ]
 
   run bash "$SCRIPTS/delivery.sh" set turn claude-code "$proj_a"
   [ "$status" -eq 0 ]
-  wait_for_pid_exit "$pid_a"
+  sleep 1
 
   # Target project A: watcher killed, pidfile removed.
-  ! kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
 
   # Other project B: watcher and its pidfile must survive.
@@ -1479,14 +1680,13 @@ JSON
   local pid_a=$!
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.off-a.pid"
-  wait_for_file "$TEST_SKILL_DIR/run/watch.off-b.pid"
+  sleep 1
 
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$proj_a"
   [ "$status" -eq 0 ]
-  wait_for_pid_exit "$pid_a"
+  sleep 1
 
-  ! kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_a" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/watch.off-a.pid" ]
   kill -0 "$pid_b" 2>/dev/null
   [ -f "$TEST_SKILL_DIR/run/watch.off-b.pid" ]
@@ -1512,21 +1712,13 @@ JSON
   local pid_a=$!
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-a.pid"
-  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-b.pid"
+  sleep 1
 
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 2 watch" ]]
-  # BOTH watchers must be waited for. `stop` sends TERM to each and returns;
-  # the order they actually die in is not guaranteed, so waiting only on A and
-  # asserting B in the same breath races B's exit trap. The `sleep 1` this
-  # replaced happened to cover both — the two other project-scoped tests above
-  # wait on one pid only because their second watcher is asserted to still be
-  # ALIVE, which needs no grace period.
-  wait_for_pid_exit "$pid_a"
-  wait_for_pid_exit "$pid_b"
-  ! kill -0 "$pid_a" 2>/dev/null
-  ! kill -0 "$pid_b" 2>/dev/null
+  sleep 1
+  refute kill -0 "$pid_a" 2>/dev/null
+  refute kill -0 "$pid_b" 2>/dev/null
 
   rm -rf "$proj_b"
 }
@@ -1597,15 +1789,7 @@ skip_if_no_special_fs() {
   local cmd
   cmd=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.Stop[0].hooks[0].command');")
   [[ "$cmd" == *"check-inbox.sh"* ]]
-  # Beyond JSON validity: the "command" value is itself later executed by a
-  # shell (Claude Code's hook runner). The embedded ' and " must not be able
-  # to break out of their argument boundary — the shell must see exactly 3
-  # arguments, with the project path arriving back intact as one of them
-  # (F14 hardening; pre-fix, the embedded ' broke the naive `'$project'`
-  # wrap and the rest of the string ran as unintended shell syntax).
-  eval "set -- $cmd"
-  [ "$#" -eq 3 ]
-  [ "$3" = "$proj" ]
+  [[ "$cmd" == *"o'\\''brien \"x\""* ]]
 }
 
 @test "delivery set turn: project path with quotes yields valid JSON + commandWindows (codex) (#134)" {
@@ -1640,22 +1824,6 @@ skip_if_no_special_fs() {
   local cmd
   cmd=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.Stop[0].hooks[0].command');")
   [[ "$cmd" == *'a\b'* ]]
-}
-
-@test "delivery set monitor: project path with a single quote can't break SessionStart/SessionEnd argument boundaries (F14 hardening)" {
-  skip_if_no_special_fs
-  local proj="$TEST_PROJECT/al'ice"
-  mkdir -p "$proj"
-  run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$proj"
-  [ "$status" -eq 0 ]
-  local hf="$proj/.claude/settings.local.json"
-  local hfq; hfq=$(sql_lit "$hf")
-  [ "$(sqlite_mem "SELECT json_valid(readfile('$hfq'));")" = "1" ]
-  local ss se
-  ss=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.SessionStart[0].hooks[0].command');")
-  se=$(sqlite_mem "SELECT json_extract(readfile('$hfq'), '\$.hooks.SessionEnd[0].hooks[0].command');")
-  eval "set -- $ss"; [ "$#" -eq 3 ]; [ "$3" = "$proj" ]
-  eval "set -- $se"; [ "$#" -eq 3 ]; [ "$3" = "$proj" ]
 }
 
 @test "delivery set monitor: existing settings with single-quoted hook commands stays valid JSON (#134)" {
@@ -1767,7 +1935,7 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  ! has_check_inbox "$(settings_file)"
+  refute has_check_inbox "$(settings_file)"
   local allow_len
   allow_len=$(sqlite_mem "SELECT json_array_length(json_extract(readfile('$(rf "$(settings_file)")'), '\$.permissions.allow'));")
   [ "$allow_len" = "600" ]
@@ -2379,11 +2547,6 @@ EOF
     > "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
   printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"newer-by-name-uuid\",\"cwd\":\"$TEST_PROJECT\"}}" \
     > "$rollout_dir/rollout-2026-06-17T00-00-00-newer-by-name-uuid.jsonl"
-  # Stays a real sleep. This is not waiting for a process to settle — it is
-  # separating two mtimes far enough apart that the code under test can order
-  # them, and filesystem timestamp granularity is a whole second on some of the
-  # filesystems CI runs on. There is no condition to poll for: the thing being
-  # waited on is the clock itself.
   sleep 1
   touch "$rollout_dir/rollout-2020-01-01T00-00-00-stale-by-name-uuid.jsonl"
 
@@ -2432,7 +2595,7 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"Stopped 1 Codex bridge"* ]]
   [[ "$output" == *"shim"* ]]
-  ! kill -0 "$bpid" 2>/dev/null
+  refute kill -0 "$bpid" 2>/dev/null
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.pid" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.meta" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-bridge.team.alice.appserver" ]
@@ -2483,7 +2646,7 @@ EOF
 JSON
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  wait_for_file "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid"
+  sleep 1
   [ -f "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid" ]
 
   run bash "$SCRIPTS/delivery.sh" set off hermes "$TEST_PROJECT"
@@ -2540,10 +2703,6 @@ JSON
   [[ "$output" == *"agmsg-delivery-mode: monitor"* ]]
   [[ "$output" == *"monitor"* ]]
   [[ "$output" == *"watch.sh"* ]]
-  # The rule bakes the sentinel form, not a droppable empty expansion: grok's
-  # monitor tool re-evaluates the command line and deletes a quoted-but-empty
-  # "$GROK_SESSION_ID" argument, shifting every later argument one slot left.
-  [[ "$output" == *'watch.sh "${GROK_SESSION_ID:--}"'* ]]
 }
 
 @test "delivery status (grok-build): reports monitor when the monitor rule is present" {
@@ -2697,4 +2856,315 @@ JSON
   [ "$status" -eq 0 ]
   [[ "$output" == *"Codex bridge: team/bob has no session recorded (the one loaded thread is already seated by another role)"* ]]
   [[ "$output" != *"That combination is unexpected"* ]]
+}
+
+# --- "stops quietly" is what made a delivery bug expensive (#691, #692, #694) ---
+
+@test "watch: the liveness guard says which session it decided about (#692)" {
+  # The guard is right; the silence is what costs. A watcher launched with a
+  # session id that does not resolve exits here immediately, and a test then
+  # runs against no watcher while looking exactly like one that ran against
+  # one -- twice in a row, during a real investigation.
+  #
+  # A composite id whose agent pid is dead is the shape that fires it.
+  local dead
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  # No `timeout` on macOS, and the suite's own idiom is to run it and wait for
+  # it to end on its own -- which this guard makes it do immediately.
+  bash "$SCRIPTS/watch.sh" "gone-session.$dead" "$TEST_PROJECT" claude-code \
+    >/dev/null 2>/dev/null &
+  wait $! || true
+  # Said, and readable AFTERWARDS -- stderr is /dev/null where this really runs.
+  local log="$TEST_SKILL_DIR/run/watch.gone-session.$dead.log"
+  [ -f "$log" ] || { echo "no log at $log" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+  grep -q -F -- "gone-session.$dead" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: the log is written even when stderr is discarded (#691)" {
+  # The whole point. Not "we pointed stderr somewhere" -- the process is run
+  # with fd2 closed off exactly as it is in production, and the reason still
+  # has to be readable when it is over.
+  local dead
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  run bash -c \
+    "bash '$SCRIPTS/watch.sh' 'silent-session.$dead' '$TEST_PROJECT' claude-code 2>/dev/null"
+  [ "$status" -eq 0 ] || return 1
+  # Nothing reached the caller, which is the configuration being reproduced.
+  [ -z "$output" ] || { echo "expected no output, got: $output" >&2; return 1; }
+  local log="$TEST_SKILL_DIR/run/watch.silent-session.$dead.log"
+  [ -f "$log" ] || { echo "no log at $log" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: one diagnostic cannot carry the log past its cap (#691)" {
+  # The boundary, not the already-over case. A live log UNDER the cap takes one
+  # more line and must not end up over it -- the first version compared only
+  # the size already on disk, so cap-1 plus a record ended oversized and no
+  # rotation ever happened. The ceiling is the reason this design was chosen,
+  # so the ceiling is what gets measured.
+  local dead log cap=200 live rotated
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.rot-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # Just UNDER the cap. One diagnostic is ~60-90 bytes, so the next write
+  # crosses it.
+  head -c 190 /dev/zero | tr '\0' 'x' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=$cap bash "$SCRIPTS/watch.sh" \
+    "rot-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+
+  [ -f "$log.1" ] || { echo "the boundary was crossed without rotating" >&2; return 1; }
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  rotated="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log.1'")"
+  # Every generation kept is within the ceiling, which is the documented claim.
+  [ "$live" -le "$cap" ] || { echo "live log is $live bytes, cap $cap" >&2; return 1; }
+  [ "$rotated" -le "$cap" ] || { echo "rotated log is $rotated bytes, cap $cap" >&2; return 1; }
+  # And the reason still survived the rotation rather than being dropped.
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: the cap is bytes, not characters (#691)" {
+  # `${#record}` counts CHARACTERS in a UTF-8 locale while the cap and stat are
+  # BYTES, so a multibyte diagnostic passes a character check and lands over the
+  # byte ceiling. Team names may legally be Unicode and the storeless notice
+  # puts the name in the record, so this is reachable, not theoretical.
+  #
+  # Two attempts failed to measure it before this one, and both failed the same
+  # way -- the mutation stayed green. First the record was the liveness guard's,
+  # which is pure ASCII. Then the padding was large enough that BOTH counts
+  # crossed the cap, so the two answers agreed. The gap only shows in the window
+  # where chars fit and bytes do not, so the padding is computed from the record
+  # this fixture actually produces rather than guessed.
+  local log db record chars bytes pad cap live
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.mb-session.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  # Pass 1: an effectively unlimited cap, purely to observe the record.
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  local wpid=$! waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
+  [ -n "$record" ] || { echo "the notice naming the team never appeared" >&2; return 1; }
+  chars=${#record}
+  bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
+  # The two answers must actually differ, or this fixture proves nothing.
+  [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte: $chars/$bytes" >&2; return 1; }
+
+  # Pass 2: a cap inside the window -- chars say it fits, bytes say it does not.
+  cap=$(( 120 + chars + 1 ))
+  pad=120
+  rm -f "$log" "$log.1"
+  head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" mb-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    grep -q 'no store yet' "$log.1" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$cap" ] \
+    || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
+}
+
+@test "watch: an unmeasurable record rotates rather than guessing (#691)" {
+  # The fallback used to be `${#record}` -- the character count this had just
+  # been fixed away from, and fail-OPEN: with `wc` missing, the bound quietly
+  # stopped holding. It now rotates when the size cannot be measured.
+  #
+  # The cap has to sit in the window where the character count would NOT
+  # rotate, or the two behaviours agree and the case proves nothing. Same
+  # derivation as the multibyte case: observe the record, then set the cap.
+  local log db record chars bytes cap pad live shim wpid waited
+  bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
+  rm -f "$db"
+  log="$TEST_SKILL_DIR/run/watch.nowc-session.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+
+  AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=1000000 \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  record="$(grep 'no store yet' "$log" | head -1)"
+  [ -n "$record" ] || { echo "no record to size the fixture from" >&2; return 1; }
+  chars=${#record}
+  bytes="$(printf '%s' "$record" | wc -c | tr -d '[:space:]')"
+  [ "$bytes" -gt "$chars" ] || { echo "record is not multibyte" >&2; return 1; }
+
+  # In the window: the character count fits, the real byte count does not.
+  pad=120
+  cap=$(( pad + chars + 1 ))
+  rm -f "$log" "$log.1"
+  head -c "$pad" /dev/zero | tr '\0' 'x' > "$log"
+
+  # A `wc` that fails, first on PATH -- which is the one the watcher finds.
+  shim="$TEST_SKILL_DIR/shim"; mkdir -p "$shim"
+  printf '#!/bin/sh\nexit 1\n' > "$shim/wc"; chmod +x "$shim/wc"
+
+  PATH="$shim:$PATH" AGMSG_WATCH_INTERVAL=1 AGMSG_WATCH_LOG_MAX_BYTES=$cap \
+    bash "$SCRIPTS/watch.sh" nowc-session "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wpid=$!; waited=0
+  while [ "$waited" -lt 100 ]; do
+    [ -f "$log.1" ] && break
+    grep -q 'no store yet' "$log" 2>/dev/null && break
+    sleep 0.1; waited=$((waited + 1))
+  done
+  kill "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$cap" ] \
+    || { echo "live log is $live bytes, cap $cap (chars=$chars bytes=$bytes pad=$pad)" >&2; return 1; }
+  # And the diagnostic was not lost to the conservative choice.
+  grep -q 'no store yet' "$log" || { echo "the record was dropped" >&2; cat "$log" >&2; return 1; }
+}
+
+@test "watch: an invalid log cap falls back to the default, not to no bound (#691)" {
+  # `0` is the value that separates the two behaviours. Normalized, it becomes
+  # the 128 KiB default and a small log is left alone. Unnormalized, every
+  # record is "over" a cap of zero and the log rotates on every line, throwing
+  # away the previous generation each time -- the diagnostics this exists to
+  # keep.
+  #
+  # Note on the failure mode: an invalid cap does NOT kill the watcher. The
+  # value never enters `$(( ))`; it is the right-hand side of `[ -gt ]`, which
+  # errors non-fatally because this script sets `-u`, not `-e`. What it does is
+  # quietly stop the comparison from ever being true -- so the real risk is an
+  # unbounded log, and that is what is pinned here.
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.zerocap-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'a previous generation worth keeping\n' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=0 bash "$SCRIPTS/watch.sh" \
+    "zerocap-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+
+  # Treated as the default: nothing was rotated away for a 36-byte file.
+  [ ! -f "$log.1" ] || { echo "a cap of 0 rotated a tiny log" >&2; return 1; }
+  grep -q 'a previous generation worth keeping' "$log" \
+    || { echo "the previous generation was discarded" >&2; cat "$log" >&2; return 1; }
+  # And the run still said why it stopped.
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: a non-numeric log cap still rotates at the default (#691)" {
+  # The other half of the contract, as a case that can actually fail. The first
+  # version asserted only that a reason was still readable -- true whether or
+  # not the value is normalized, because an un-normalized word makes `[ -gt ]`
+  # error non-fatally and read as false, and the append then succeeds anyway.
+  # It passed under mutation, so it measured nothing.
+  #
+  # What separates the two: put the live log just under the SHIPPED default and
+  # write one more record. Normalized, `oops` IS the default, so this crosses it
+  # and rotates. Un-normalized, the comparison is false forever and nothing
+  # rotates however large the file gets.
+  local dead log default=131072
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.bogus-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  # 40 bytes short of the default: any diagnostic is longer than that.
+  head -c $(( default - 40 )) /dev/zero | tr '\0' 'x' > "$log"
+
+  AGMSG_WATCH_LOG_MAX_BYTES=oops bash "$SCRIPTS/watch.sh" \
+    "bogus-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+
+  [ -f "$log.1" ] \
+    || { echo "a non-numeric cap did not fall back to the default bound" >&2; return 1; }
+  local live
+  live="$(bash -c ". '$SCRIPTS/lib/compat.sh'; compat_file_size '$log'")"
+  [ "$live" -le "$default" ] || { echo "live log is $live bytes" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "watch: a record larger than the whole cap is kept, not dropped (#691)" {
+  # The stated exception. A single diagnostic bigger than the cap cannot fit
+  # under it; rotating first and writing it whole beats dropping the one line
+  # someone is looking for. Named so the behaviour is a decision, not a
+  # surprise.
+  local dead log
+  dead="$(bash -c 'echo $$')"
+  wait_for_pid_exit "$dead" || true
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  log="$TEST_SKILL_DIR/run/watch.tiny-session.$dead.log"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  AGMSG_WATCH_LOG_MAX_BYTES=1 bash "$SCRIPTS/watch.sh" \
+    "tiny-session.$dead" "$TEST_PROJECT" claude-code >/dev/null 2>/dev/null &
+  wait $! || true
+  [ -f "$log" ] || { echo "the diagnostic was dropped entirely" >&2; return 1; }
+  grep -q "no longer alive" "$log" || { cat "$log" >&2; return 1; }
+}
+
+@test "check-inbox: a live watcher no longer stops the turn side (#694)" {
+  # The negative control for `both`. Before this, ANY live watcher pid made
+  # this hook exit 0 -- including a watcher delivering nothing, which is the
+  # one situation `both` is reached for. The watcher here is alive and does
+  # nothing at all, which is precisely the failure.
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" testteam bob claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "delivered by neither" >/dev/null
+
+  # A watcher that is alive and delivering nothing.
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sleep 60 &
+  local idle=$!
+  printf '%s\n' "$idle" > "$TEST_SKILL_DIR/run/watch.both-session.pid"
+
+  run bash -c "printf '%s' '{\"session_id\":\"both-session\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  kill "$idle" 2>/dev/null || true
+  [ "$status" -eq 0 ] || return 1
+  printf '%s\n' "$output" | grep -q 'delivered by neither' \
+    || { echo "the turn side still stood down: $output" >&2; return 1; }
+}
+
+@test "check-inbox: what the watcher already took is not offered twice (#694)" {
+  # Why removing the deferral is safe, measured rather than argued. The watcher
+  # consumes through storage_read_cursor_consume, which records a message_read
+  # event per delivered id AND advances the cursor; storage_list_unread
+  # excludes both. Same state, so no duplicate.
+  bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/join.sh" testteam bob claude-code "$TEST_PROJECT" >/dev/null
+  bash "$SCRIPTS/send.sh" testteam bob alice "taken by the watcher" >/dev/null
+
+  # Stand in for the watcher's consume, using the same facade it calls.
+  local id
+  id="$(bash -c ". '$SCRIPTS/lib/storage.sh'; agmsg_storage_load; \
+    storage_list_unread testteam alice" | sed -n 's/.*\"id\":\"\([^\"]*\)\".*/\1/p' | head -1)"
+  [ -n "$id" ] || return 1
+  bash -c ". '$SCRIPTS/lib/storage.sh'; agmsg_storage_load; \
+    storage_read_cursor_consume testteam alice 999999 '$id'" >/dev/null
+
+  run bash -c "printf '%s' '{\"session_id\":\"dup-session\"}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$TEST_PROJECT'"
+  [ "$status" -eq 0 ] || return 1
+  run bash -c "printf '%s\n' \"\$1\" | grep -q 'taken by the watcher'" _ "$output"
+  [ "$status" -ne 0 ] || { echo "the hook re-offered a consumed message" >&2; return 1; }
 }

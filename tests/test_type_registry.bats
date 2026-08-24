@@ -64,6 +64,112 @@ write_node_launcher_fixtures() {
   [ "$status" -ne 0 ]
 }
 
+@test "agent templates route remote-import intent before not_joined identity setup" {
+  local template not_joined first_time guard
+  for template in "$BATS_TEST_DIRNAME"/../scripts/drivers/types/*/template.md; do
+    [ -f "$template" ] || continue
+    grep -q '^## Identity$' "$template" || continue
+    not_joined="$(grep -n '^\*\*C) Not in a team:\*\*$' "$template" | cut -d: -f1)"
+    first_time="$(grep -n '^  > \*\*First-time setup required\.\*\*$' "$template" | cut -d: -f1)"
+    guard="$(grep -n 'Before first-time setup, inspect the user'"'"'s request' "$template" | cut -d: -f1)"
+    [ -n "$not_joined" ]
+    [ "$not_joined" -lt "$guard" ]
+    [ "$guard" -lt "$first_time" ]
+    sed -n "${guard},$((first_time - 1))p" "$template" |
+      grep -q 'do not call `join.sh`'
+    sed -n "${guard},$((first_time - 1))p" "$template" |
+      grep -q 'team-list.sh --json --scope all'
+    sed -n "${guard},$((first_time - 1))p" "$template" |
+      grep -q 'Go directly to `remote pull`'
+  done
+
+  not_joined="$(grep -n '^### Step 2a: If not in a team' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  first_time="$(grep -n '^Ask the user for a team name\.' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  guard="$(grep -n '^Before first-time setup, inspect the user'"'"'s request\.' "$BATS_TEST_DIRNAME/../SKILL.md" | cut -d: -f1)"
+  [ -n "$not_joined" ]
+  [ "$not_joined" -lt "$guard" ]
+  [ "$guard" -lt "$first_time" ]
+}
+
+@test "agent templates all explain that readable local history is not evidence a team is unencrypted (#682)" {
+  # scripts/drivers/types/*/template.md is nine independent copies with no
+  # shared fragment (#676's exact shape) -- a loop with `[ -f ] || continue`
+  # alone would silently pass if the glob matched fewer than nine files (a
+  # renamed/missing template), so the count is asserted explicitly rather
+  # than just "every file found had it."
+  local template count=0
+  for template in "$BATS_TEST_DIRNAME"/../scripts/drivers/types/*/template.md; do
+    [ -f "$template" ] || continue
+    count=$((count + 1))
+    grep -q "Readable local history is therefore not evidence that a team is unencrypted" "$template" \
+      || { echo "missing the e2ee-verification paragraph: $template" >&2; return 1; }
+  done
+  # agmsg-app has no template.md (spawnable=no -- it's the desktop app's own
+  # identity, not a CLI type), so nine is the whole set, not a lower bound a
+  # silently-skipped file could still satisfy.
+  [ "$count" -eq 9 ]
+}
+
+@test "the e2ee-verification explanation also appears in both remote-setup docs (#682)" {
+  grep -q "readable local message history is not evidence" "$BATS_TEST_DIRNAME/../docs/remote-setup.md"
+  grep -q "ローカルのメッセージ履歴が読めることは" "$BATS_TEST_DIRNAME/../docs/remote-setup.ja.md"
+}
+
+@test "every agent-readable surface routes key rotate, and none of them calls it unavailable" {
+  # The claim being guarded is not a wording preference: `key rotate` shipped
+  # on 2026-07-22 and seven days later ten surfaces began telling every agent
+  # it was "not available yet (they refuse unconditionally and change no
+  # state)". An agent reads one of these at startup, so the lie was answered
+  # to users far more often than any doc under docs/ is read.
+  #
+  # The negative half alone would pass on a file that says nothing at all, so
+  # both halves are asserted, and the count is explicit for the same reason as
+  # the #682 test above.
+  # A template is an installer INPUT: install.sh renders it with
+  # `sed s/__SKILL_NAME__/$CMD_NAME/g`, so a route written with a literal
+  # `agmsg` sends an agent installed as `--cmd m` at somebody else's install
+  # — and rotation changes key state, so that is not a cosmetic slip. The
+  # path is therefore asserted per surface kind, not as one shared substring:
+  # matching only `key.sh rotate <team>` is green for both spellings and
+  # would have let this through.
+  local surface count=0
+  for surface in "$BATS_TEST_DIRNAME"/../scripts/drivers/types/*/template.md \
+                 "$BATS_TEST_DIRNAME"/../SKILL.md; do
+    [ -f "$surface" ] || continue
+    count=$((count + 1))
+    case "$surface" in
+      */SKILL.md)
+        # The top-level skill doc is a rendered artifact, not an input: it
+        # carries no placeholder at all, so here the literal is correct.
+        grep -Fq 'bash ~/.agents/skills/agmsg/scripts/key.sh rotate <team>' "$surface" \
+          || { echo "SKILL.md does not route rotate through the literal install path: $surface" >&2; return 1; }
+        ;;
+      *)
+        grep -Fq 'bash ~/.agents/skills/__SKILL_NAME__/scripts/key.sh rotate <team>' "$surface" \
+          || { echo "template does not route rotate through __SKILL_NAME__: $surface" >&2; return 1; }
+        ! grep -Fq '~/.agents/skills/agmsg/' "$surface" \
+          || { echo "template hardcodes the default install name: $surface" >&2; return 1; }
+        ;;
+    esac
+    grep -Fq 'Device pairing (`key request` / `key approve`) is not implemented' "$surface" \
+      || { echo "does not state the pairing commands are absent: $surface" >&2; return 1; }
+    ! grep -qiE 'rotat(e|ion)[^.]*not available' "$surface" \
+      || { echo "still calls rotation unavailable: $surface" >&2; return 1; }
+  done
+  # nine templates (agmsg-app has none) plus SKILL.md.
+  [ "$count" -eq 10 ]
+
+  # Bind the claim to the code. If `rotate` ever stops being a subcommand the
+  # surfaces above become wrong again, and this is the line that says so.
+  grep -qE '^[[:space:]]*rotate\)' "$BATS_TEST_DIRNAME/../scripts/key.sh"
+  grep -qE '^cmd_rotate\(\)' "$BATS_TEST_DIRNAME/../scripts/key.sh"
+
+  # The same false sentence also stood in key.sh itself, where `generate`
+  # refuses an existing key: it named rotation unavailable and sent the user
+  # to `show`. Assert the working route is offered there too.
+  grep -Fq 'To mint a replacement epoch instead:' "$BATS_TEST_DIRNAME/../scripts/key.sh"
+}
+
 @test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
   # hermes deliberately stays out (#279): no known CLI mode starts it
   # interactive with a seeded initial prompt. agmsg-app also stays out: it's
@@ -206,7 +312,7 @@ write_node_launcher_fixtures() {
   write_node_launcher_fixtures
   run "$SCRIPTS/spawn.sh" nodetype someagent --project "$BATS_TEST_TMPDIR"
   [ "$status" -ne 0 ]
-  ! echo "$output" | grep -q "is not supported by spawn yet"
+  refute grep -q "is not supported by spawn yet" <<<"$output"
   ! echo "$output" | grep -q "unknown agent type"
 }
 

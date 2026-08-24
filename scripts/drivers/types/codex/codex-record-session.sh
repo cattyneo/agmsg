@@ -159,7 +159,7 @@ if [ -z "$thread" ]; then
   # nothing, which is what happens today.
   #
   # ${HOME:-} so an unset HOME under `set -u` is a silent no-op (empty -> the
-  # dir check below fails -> fresh), not an unbound-variable abort (co1 nit).
+  # dir check below fails -> fresh), not an unbound-variable abort (nit).
   sessions_dir="${HOME:-}/.codex/sessions"
   if [ -n "${HOME:-}" ] && [ -d "$sessions_dir" ]; then
     # Distinct thread ids whose session_meta cwd (canonicalized -- codex records
