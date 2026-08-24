@@ -252,7 +252,10 @@ OpenSSL 3, `xxd`, and the existing storage facade.
 1. Port the Board runtime probe under agmsg names: deterministic absolute
    candidates, OpenSSL major 3, actual Ed25519 sign/verify and SHA-256 probes,
    exact 258-byte `xxd` round-trip, private `mktemp` directory, child/signal
-   cleanup, and bounded diagnostics. Receipt operations alone invoke it.
+   cleanup, and bounded diagnostics. Preserve the Board-equivalent optional
+   `AGMSG_RECEIPT_OPENSSL` / `AGMSG_RECEIPT_XXD` absolute-executable overrides;
+   an override is accepted only after the same full capability probe and never
+   becomes a PATH fallback. Receipt operations alone invoke this runtime.
 2. Implement `storage_receipt_init` as the only schema/key writer. Serialize
    concurrent initializers with the exact Task 1 lock/owner/reclaim protocol and
    recheck all state after taking or reclaiming it. Preflight the
