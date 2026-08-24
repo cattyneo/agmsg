@@ -911,11 +911,10 @@ assert_crash_marker() {
 }
 
 @test "init rejects an unsafe lock mode without deleting it" {
-  skip_unless_process_identity
   init_ready
   local nonce=01112233445566778899aabbccddeeff lock
   lock="$(receipt_lock)"
-  write_lock_record "$lock" "$(dead_pid)" "$nonce"
+  write_lock_record "$lock" "$$" "$nonce"
   chmod 644 "$lock"
   run --separate-stderr storage_receipt_init receipts
   assert_status 12 corrupt_state
@@ -1091,20 +1090,13 @@ assert_crash_marker() {
 }
 
 @test "live init lock is refused and never removed" {
-  skip_unless_process_identity
   init_ready
   local nonce=10112233445566778899aabbccddeeff lock
   lock="$(receipt_lock)"
-  sleep 30 &
-  local owner_pid=$!
-  register_test_pid "$owner_pid"
-  write_lock_record "$lock" "$owner_pid" "$nonce"
+  write_lock_record "$lock" "$$" "$nonce"
   run --separate-stderr storage_receipt_init receipts
   assert_status 13 runtime_error
   [ -f "$lock" ]
-  registered_pid_matches "$owner_pid" && kill "$owner_pid" 2>/dev/null || true
-  wait "$owner_pid" 2>/dev/null || true
-  unregister_test_pid "$owner_pid"
 }
 
 @test "malformed init lock is corrupt state and is never removed" {

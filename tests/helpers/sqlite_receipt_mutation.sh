@@ -233,7 +233,7 @@ receipt_apply_mutation() {
     no-receipt-dir-integrity)
       _receipt_mutation_rewrite "$receipt" \
         '[ -d "$path" ] && [ ! -L "$path" ] || return 1' \
-        '[ -d "$path" ] || return 1' || return 1
+        '[ -L "$path" ] && return 0; [ -d "$path" ] || return 1' || return 1
       ;;
     no-key-integrity)
       _receipt_mutation_rewrite "$receipt" \

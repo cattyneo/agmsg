@@ -970,6 +970,31 @@ SH
   [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM read_cursors;")" = 0 ]
 }
 
+@test "Task 4 ack begins one IMMEDIATE transaction before durable writes" {
+  ack_abi_required
+  sql_event immediate alice bob body 2026-01-01T00:00:00Z
+  local token db real_sqlite
+  token="$(issue_list_token bob)"; db="$(agmsg_db_path receipts)"
+  real_sqlite="$(command -v sqlite3)"
+  agmsg_sqlite() {
+    local input rc
+    case " $* " in
+    *' -batch '*)
+      input="$BATS_TEST_TMPDIR/immediate.sql"; cat >"$input"
+      if grep -q 'CREATE TEMP TABLE _ack_expected' "$input"; then
+        [ "$(grep -c '^BEGIN IMMEDIATE;$' "$input")" -eq 1 ] || return 97
+      fi
+      "$real_sqlite" "$@" <"$input"; rc=$?; return "$rc"
+      ;;
+    esac
+    "$real_sqlite" "$@"
+  }
+  run storage_ack_receipt receipts bob --receipt "$token"
+  unset -f agmsg_sqlite
+  [ "$status" -eq 0 ]
+  [ "$(sqlite3 "$db" 'SELECT COUNT(*) FROM receipt_nonces;')" = 1 ]
+}
+
 @test "Task 4 an injected COMMIT-boundary failure cannot report or retain success" {
   ack_abi_required
   sql_event commit-fault alice bob body 2026-01-01T00:00:00Z

@@ -22,18 +22,19 @@ mutation_source() {
 }
 
 run_mutant_regression() {
-  local id="$1" filter="$2" source scratch rc test_file
+  local id="$1" filter="$2" source scratch rc test_file nested
   source="$(mutation_source)"
   scratch="$BATS_TEST_TMPDIR/mutant-$id"
   mkdir "$scratch"
-  receipt_mutation_archive "$source" "$scratch" || return 1
-  receipt_apply_mutation "$id" "$scratch" || return 1
+  receipt_mutation_archive "$source" "$scratch" || return 2
+  receipt_apply_mutation "$id" "$scratch" || return 2
   case "$id" in
     prune-boundary-inclusive)
       receipt_prune_boundary_probe "$scratch" "$BATS_TEST_TMPDIR/prune-boundary" >/dev/null 2>&1
       rc=$?
-      [ "$rc" -ne 0 ]
-      return $?
+      [ "$rc" -eq 1 ] && return 0
+      [ "$rc" -eq 0 ] && return 1
+      return 2
       ;;
   esac
   case "$id" in
@@ -41,28 +42,44 @@ run_mutant_regression() {
       test_file="$scratch/tests/test_sqlite_receipt_keys.bats" ;;
     *) test_file="$scratch/tests/test_sqlite_receipt_ack.bats" ;;
   esac
-  receipt_run_bounded 45 rtk bats --filter "$filter" "$test_file" >/dev/null 2>/dev/null
+  nested="$BATS_TEST_TMPDIR/nested-$id.tap"
+  receipt_run_bounded 45 rtk bats --filter "$filter" "$test_file" >"$nested" 2>/dev/null
   rc=$?
-  # Only the exit code is retained.  Nested Bats output may contain message
-  # bodies or signed receipt material and is intentionally never re-emitted.
-  [ "$rc" -ne 0 ]
+  # Only an ordinary Bats assertion failure kills the mutant.  A signal,
+  # timeout, command/setup error, or a surviving mutant must not become false
+  # positive evidence.  Nested output may contain message bodies or signed
+  # receipt material and is intentionally never re-emitted.
+  if [ "$rc" -eq 1 ]; then
+    grep -q '^not ok ' "$nested" && return 0
+    return 2
+  fi
+  if [ "$rc" -eq 0 ]; then
+    grep -q '^ok ' "$nested" || return 2
+    grep -q '^ok .* # skip ' "$nested" && return 2
+    return 1
+  fi
+  return 2
 }
 
 run_mutant_subset() {
-  local subset="$1" spec id filter killed=0 total
+  local subset="$1" spec id filter rc killed=0 survived=0 invalid=0 total
   shift
   total="$#"
   for spec in "$@"; do
     id="${spec%%|*}"; filter="${spec#*|}"
     if run_mutant_regression "$id" "$filter"; then
-      killed=$((killed + 1))
-      printf '%s: killed\n' "$id"
+      rc=0
     else
-      printf '%s: SURVIVED or mutation setup failed\n' "$id" >&2
-      return 1
+      rc=$?
     fi
+    case "$rc" in
+      0) killed=$((killed + 1)); printf '%s: killed\n' "$id" ;;
+      1) survived=$((survived + 1)); printf '%s: SURVIVED\n' "$id" >&2 ;;
+      *) invalid=$((invalid + 1)); printf '%s: INVALID mutation run\n' "$id" >&2 ;;
+    esac
   done
-  printf 'subset=%s killed=%s/%s\n' "$subset" "$killed" "$total"
+  printf 'subset=%s killed=%s/%s survived=%s invalid=%s\n' \
+    "$subset" "$killed" "$total" "$survived" "$invalid"
   [ "$killed" -eq "$total" ]
 }
 
@@ -77,7 +94,7 @@ run_mutant_subset() {
     'no-store-binding|Task 4 authenticates canonical lifetime key generation' \
     'no-frame-binding|Task 4 independently binds every displayed field' \
     'no-temp-body-comparison|Task 4 statement failure and outer-verification drift' \
-    'no-begin-immediate|Task 4 all write-stage faults' \
+    'no-begin-immediate|Task 4 ack begins one IMMEDIATE transaction' \
     'no-nonce-uniqueness|Task 4 same-token concurrency commits once' \
     'weak-legacy-identity|Task 4 transaction guards the full event-linked legacy identity' \
     'unbounded-prune|Task 4 retained expiry retries reconcile' \
@@ -89,7 +106,7 @@ run_mutant_subset() {
     'no-db-integrity|status rejects a SQLite DB symlink' \
     'no-receipt-dir-integrity|status rejects a receipt directory symlink' \
     'no-key-integrity|status rejects a private key symlink' \
-    'no-init-lock-integrity|malformed init lock is corrupt state' \
+    'no-init-lock-integrity|init rejects an unsafe lock mode' \
     'no-dead-owner-check|live init lock is refused'
 }
 
