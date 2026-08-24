@@ -637,9 +637,10 @@ assert_crash_marker() {
   storage_receipt_init receipts >/dev/null
   local before after
   before="$(store_fingerprint)"
-  run storage_ack_receipt receipts bob --receipt not-a-receipt
+  run --separate-stderr storage_ack_receipt receipts bob --receipt not-a-receipt
   [ "$status" -ne 0 ]
   [ -z "$output" ]
+  [ -n "$stderr" ]
   after="$(store_fingerprint)"
   [ "$after" = "$before" ]
 }
