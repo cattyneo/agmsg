@@ -314,8 +314,8 @@ assert_bounded_stderr() {
   [ "$(printf '%s' "$output" | jq -r '.id')" = opaque/id.v1 ]
   run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
   [ "$status" -eq 0 ]
-  [[ "$output" == *legacy-body* ]]
-  [[ "$output" == *'"id":"opaque/id.v1"'* ]]
+  printf '%s\n' "$output" | grep -Fq -- 'legacy-body'
+  printf '%s\n' "$output" | grep -Fq -- '"id":"opaque/id.v1"'
 }
 
 @test "sqlite malformed candidate metadata fails before stdout" {
