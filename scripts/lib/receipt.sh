@@ -465,8 +465,18 @@ EOF
 }
 
 _agmsg_receipt_base64url_file() {
-  "$AGMSG_RECEIPT_OPENSSL_RESOLVED" base64 -A -in "$1" 2>/dev/null |
-    /usr/bin/tr '+/' '-_' | /usr/bin/tr -d '='
+  local input="$1" encoded="${1}.base64" status=0 cleanup_status=0
+  ( umask 077; : >"$encoded" ) 2>/dev/null || return 13
+  if ! "$AGMSG_RECEIPT_OPENSSL_RESOLVED" base64 -A -in "$input" \
+      >"$encoded" 2>/dev/null; then
+    /bin/rm -f -- "$encoded" 2>/dev/null || true
+    return 13
+  fi
+  ( set -o pipefail
+    /usr/bin/tr '+/' '-_' <"$encoded" | /usr/bin/tr -d '='
+  ) || status=$?
+  /bin/rm -f -- "$encoded" 2>/dev/null || cleanup_status=$?
+  [ "$status" -eq 0 ] && [ "$cleanup_status" -eq 0 ] || return 13
 }
 
 # Consume a validated SQLite snapshot on stdin, construct/sign the private
@@ -547,8 +557,14 @@ EOF
     _agmsg_receipt_error 'cannot sign receipt'
     exit 13
   }
-  payload_b64="$(_agmsg_receipt_base64url_file "$payload")" || exit 13
-  signature_b64="$(_agmsg_receipt_base64url_file "$signature")" || exit 13
+  payload_b64="$(_agmsg_receipt_base64url_file "$payload")" || {
+    _agmsg_receipt_error 'cannot encode receipt'
+    exit 13
+  }
+  signature_b64="$(_agmsg_receipt_base64url_file "$signature")" || {
+    _agmsg_receipt_error 'cannot encode receipt'
+    exit 13
+  }
   case "$payload_b64" in ''|*[!A-Za-z0-9_-]*) exit 13 ;; esac
   case "$signature_b64" in ''|*[!A-Za-z0-9_-]*) exit 13 ;; esac
   token="$payload_b64.$signature_b64"
