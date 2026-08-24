@@ -844,6 +844,18 @@ _sqlite_receipt_ack_transaction() {
             OR lower(hex(CAST(o.id AS BLOB)))!=x.id_hex
             OR lower(hex(CAST(o.body AS BLOB)))!=x.body_hex)
       THEN 1 ELSE 0 END;\n" "$selected" "$selected" "$selected"
+    printf "INSERT INTO _ack_guard SELECT CASE WHEN NOT EXISTS(
+      SELECT 1 FROM _ack_expected x
+      JOIN events e ON x.source='event' AND e.seq=x.source_ord
+      LEFT JOIN messages m ON m.id=e.legacy_id
+      WHERE e.legacy_id IS NOT NULL AND (
+        m.id IS NULL
+        OR lower(hex(CAST(m.team AS BLOB)))!=x.team_hex
+        OR lower(hex(CAST(m.from_agent AS BLOB)))!=x.from_hex
+        OR lower(hex(CAST(m.to_agent AS BLOB)))!=x.to_hex
+        OR lower(hex(CAST(m.body AS BLOB)))!=x.body_hex
+        OR lower(hex(CAST(m.created_at AS BLOB)))!=x.at_hex))
+      THEN 1 ELSE 0 END;\n"
     printf "DELETE FROM receipt_nonces WHERE expires_at < CAST(strftime('%%s','now') AS INTEGER)-86400;\n"
     printf "INSERT INTO receipt_nonces(nonce,payload_sha256,store_generation,team_sha256,recipient_sha256,batch_sha256,frame_sha256,expires_at,committed_at) VALUES('%s','%s','%s','%s','%s','%s','%s',%s,CAST(strftime('%%s','now') AS INTEGER));\n" \
       "$nonce" "$payload_sha" "$generation" "$team_sha" "$recipient_sha" \
@@ -856,11 +868,16 @@ _sqlite_receipt_ack_transaction() {
       WHERE rowid IN (SELECT source_ord FROM _ack_expected WHERE source='legacy');\n"
     printf "UPDATE messages SET read_at=strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now')
       WHERE id IN (
-        SELECT e.legacy_id FROM events e JOIN _ack_expected x
+        SELECT m.id FROM events e JOIN _ack_expected x
           ON x.source='event' AND e.seq=x.source_ord
          AND lower(hex(CAST(e.id AS BLOB)))=x.id_hex
          AND lower(hex(CAST(e.body AS BLOB)))=x.body_hex
-         AND e.legacy_id IS NOT NULL);\n"
+        JOIN messages m ON m.id=e.legacy_id
+         AND lower(hex(CAST(m.team AS BLOB)))=x.team_hex
+         AND lower(hex(CAST(m.from_agent AS BLOB)))=x.from_hex
+         AND lower(hex(CAST(m.to_agent AS BLOB)))=x.to_hex
+         AND lower(hex(CAST(m.body AS BLOB)))=x.body_hex
+         AND lower(hex(CAST(m.created_at AS BLOB)))=x.at_hex);\n"
     printf "INSERT OR IGNORE INTO read_cursors(team,agent,local_position) VALUES('%s','%s',0);\n" "$tl" "$al"
     printf "UPDATE read_cursors SET local_position=MAX(local_position,MIN(%s,
       COALESCE((SELECT MIN(e.seq)-1 FROM events e
@@ -945,11 +962,25 @@ storage_ack_receipt() {
     _agmsg_receipt_ack_diagnostic invalid
     return 13
   }
+  [ "${#token}" -le 2048 ] || { _agmsg_receipt_ack_diagnostic invalid; return 13; }
+  case "$token" in
+    *.*) ;;
+    *) _agmsg_receipt_ack_diagnostic invalid; return 13 ;;
+  esac
+  [ -n "${token%%.*}" ] && [ -n "${token#*.}" ] || {
+      _agmsg_receipt_ack_diagnostic invalid
+      return 13
+    }
+  case "${token#*.}" in
+    *.*) _agmsg_receipt_ack_diagnostic invalid; return 13 ;;
+  esac
   if ! agmsg_validate_team_name "$team" >/dev/null 2>&1 ||
      ! agmsg_validate_agent_name "$recipient" >/dev/null 2>&1; then
     _agmsg_receipt_ack_diagnostic scope
     return 13
   fi
+  _agmsg_receipt_platform || return $?
+  _agmsg_receipt_validate_store "$team" || return $?
   # Preserve the closed shared claim predicate's exact refusal diagnostic.
   _agmsg_receipt_capability_claim_check "$team" || return $?
   _agmsg_receipt_ack "$team" "$recipient" "$token"

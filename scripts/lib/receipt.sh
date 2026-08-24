@@ -750,6 +750,19 @@ _agmsg_receipt_reconcile_nonce() {
   [ "$result" = "$payload_sha:$generation:$team_sha:$recipient_sha:$batch_sha:$frame_sha:$expires" ]
 }
 
+_agmsg_receipt_postauth_refuse() {
+  local reason="$1" team="$2" nonce="$3" payload_sha="$4" generation="$5"
+  local team_sha="$6" recipient_sha="$7" batch_sha="$8" frame_sha="$9"
+  shift 9
+  local expires="$1"
+  if _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
+      "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires"; then
+    _agmsg_receipt_ack_diagnostic already
+    return 13
+  fi
+  _agmsg_receipt_ack_diagnostic "$reason"
+}
+
 # Authenticates and acknowledges one receipt. All token material and expected
 # raw row bytes stay in an owner-only directory; the SQLite driver receives
 # only its pathname and validated scalar hashes.
@@ -861,9 +874,15 @@ _agmsg_receipt_ack() (
   rows="$tmp/rows"
   snapshot="$(_sqlite_data_stdin "$team" \
     "$(_sqlite_receipt_ack_snapshot_sql "$team" "$recipient" "$selected")")" || {
-      _agmsg_receipt_ack_diagnostic failed; exit 13
+      _agmsg_receipt_postauth_refuse failed "$team" "$nonce" "$payload_sha" \
+        "$generation" "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" \
+        "$expires"; exit 13
     }
-  printf '%s\n' "$snapshot" | sed -n 's/^__agmsg_receipt_row|//p' >"$rows" || exit 13
+  printf '%s\n' "$snapshot" | sed -n 's/^__agmsg_receipt_row|//p' >"$rows" || {
+    _agmsg_receipt_postauth_refuse failed "$team" "$nonce" "$payload_sha" \
+      "$generation" "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" \
+      "$expires"; exit 13
+  }
   [ "$(wc -l <"$rows" | /usr/bin/tr -d ' ')" = "$selected" ] || {
     _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
       "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
@@ -872,10 +891,22 @@ _agmsg_receipt_ack() (
     _agmsg_receipt_ack_diagnostic prefix; exit 13
   }
   batch="$tmp/batch"; frame="$tmp/frame"
-  _agmsg_receipt_canonicalize batch "$rows" "$batch" &&
-    _agmsg_receipt_canonicalize frame "$rows" "$frame" || exit 13
-  actual_batch="$(_agmsg_receipt_file_sha256 "$batch")" || exit 13
-  actual_frame="$(_agmsg_receipt_file_sha256 "$frame")" || exit 13
+  if ! _agmsg_receipt_canonicalize batch "$rows" "$batch" ||
+     ! _agmsg_receipt_canonicalize frame "$rows" "$frame"; then
+    _agmsg_receipt_postauth_refuse failed "$team" "$nonce" "$payload_sha" \
+      "$generation" "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" \
+      "$expires"; exit 13
+  fi
+  actual_batch="$(_agmsg_receipt_file_sha256 "$batch")" || {
+    _agmsg_receipt_postauth_refuse failed "$team" "$nonce" "$payload_sha" \
+      "$generation" "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" \
+      "$expires"; exit 13
+  }
+  actual_frame="$(_agmsg_receipt_file_sha256 "$frame")" || {
+    _agmsg_receipt_postauth_refuse failed "$team" "$nonce" "$payload_sha" \
+      "$generation" "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" \
+      "$expires"; exit 13
+  }
   [ "$actual_batch" = "$batch_sha" ] && [ "$actual_frame" = "$frame_sha" ] || {
     _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
       "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
@@ -886,7 +917,9 @@ _agmsg_receipt_ack() (
 
   if ! _agmsg_receipt_validate_store "$team" >/dev/null 2>&1 ||
      ! _agmsg_receipt_validate_ready "$team" >/dev/null 2>&1; then
-      _agmsg_receipt_ack_diagnostic failed; exit 13
+      _agmsg_receipt_postauth_refuse failed "$team" "$nonce" "$payload_sha" \
+        "$generation" "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" \
+        "$expires"; exit 13
   fi
   _sqlite_receipt_ack_transaction "$team" "$recipient" "$rows" "$nonce" \
     "$payload_sha" "$generation" "$key_sha" "$team_sha" "$recipient_sha" "$batch_sha" \
@@ -898,6 +931,19 @@ _agmsg_receipt_ack() (
         _agmsg_receipt_ack_diagnostic already; exit 13
       }
     [ "$transaction_rc" -eq 75 ] && { _agmsg_receipt_ack_diagnostic busy; exit 13; }
+    now="$(/bin/date +%s)"
+    case "$now" in ''|*[!0-9]*) ;; *)
+      if [ "$now" -lt "$issued" ]; then
+        _agmsg_receipt_ack_diagnostic future; exit 13
+      fi
+      if [ "$now" -ge "$expires" ]; then
+        [ "$now" -gt $((expires + 86400)) ] && {
+          _agmsg_receipt_ack_diagnostic stale; exit 13
+        }
+        _agmsg_receipt_ack_diagnostic expired; exit 13
+      fi
+      ;;
+    esac
     _agmsg_receipt_ack_diagnostic prefix; exit 13
   fi
   trap - EXIT HUP INT TERM
