@@ -11,6 +11,7 @@ load test_helper
 setup() {
   setup_test_env
   TEST_OWNED_PIDS=''
+  SQLITE_LOCK_PID=''
   DIAGNOSTIC_SENTINEL='eyJ2IjoxLCJ0eXBlIjoicmVjZWlwdCJ9.c2lnbmF0dXJlX3NlbnRpbmVs'
   DIAGNOSTIC_SECRET_FRAGMENT='headerless-secret-fragment-91bc4e72'
   export DIAGNOSTIC_SENTINEL DIAGNOSTIC_SECRET_FRAGMENT
@@ -108,6 +109,7 @@ EOF
 }
 
 teardown() {
+  stop_sqlite_read_lock
   cleanup_test_processes
   teardown_test_env
 }
@@ -244,6 +246,41 @@ assert_safe_diagnostics() {
   if [ -n "$forbidden" ]; then
     ! grep -Fq -- "$forbidden" "$CAPTURE_STDOUT" "$CAPTURE_STDERR"
   fi
+}
+
+start_sqlite_read_lock() {
+  local journal="$1" db fifo attempt
+  db="$(agmsg_db_path receipts)"
+  fifo="$BATS_TEST_TMPDIR/sqlite-lock.fifo"
+  sqlite3 "$db" "PRAGMA journal_mode=$journal;" >/dev/null
+  mkfifo "$fifo"
+  sqlite3 "$db" <"$fifo" >"$BATS_TEST_TMPDIR/sqlite-lock.stdout" \
+    2>"$BATS_TEST_TMPDIR/sqlite-lock.stderr" &
+  SQLITE_LOCK_PID=$!
+  exec 9>"$fifo"
+  if [ "$journal" = WAL ]; then
+    printf '%s\n' 'PRAGMA locking_mode=EXCLUSIVE;' >&9
+  fi
+  printf '%s\n' 'BEGIN EXCLUSIVE;' \
+    'UPDATE messages SET body=body WHERE 0;' >&9
+
+  for attempt in $(seq 1 100); do
+    if ! sqlite3 -cmd '.timeout 1' "$db" 'SELECT COUNT(*) FROM messages;' \
+        >/dev/null 2>&1; then
+      return 0
+    fi
+    kill -0 "$SQLITE_LOCK_PID" 2>/dev/null || break
+    sleep 0.02
+  done
+  return 1
+}
+
+stop_sqlite_read_lock() {
+  [ -n "${SQLITE_LOCK_PID:-}" ] || return 0
+  printf '%s\n' 'ROLLBACK;' >&9 2>/dev/null || true
+  exec 9>&-
+  wait "$SQLITE_LOCK_PID" 2>/dev/null || true
+  SQLITE_LOCK_PID=''
 }
 
 dead_pid() {
@@ -936,6 +973,45 @@ assert_crash_marker() {
   [ "$CAPTURE_STATUS" -eq 10 ]
   [ "$(cat "$CAPTURE_STDOUT")" = missing_deps ]
   assert_safe_diagnostics
+}
+
+@test "runtime setup failure is runtime_error and never reveals a secret TMPDIR" {
+  init_ready
+  local before after secret_tmp
+  before="$(store_fingerprint)"
+  secret_tmp="$BATS_TEST_TMPDIR/$DIAGNOSTIC_SECRET_FRAGMENT/nonexistent"
+  export TMPDIR="$secret_tmp"
+
+  capture_receipt_command runtime-setup-refusal storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 13 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = runtime_error ]
+  assert_safe_diagnostics "$secret_tmp"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "DELETE exclusive lock is runtime_error without a claim diagnostic" {
+  init_ready
+  start_sqlite_read_lock DELETE
+  export AGMSG_BUSY_TIMEOUT=50
+
+  capture_receipt_command delete-busy storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 13 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = runtime_error ]
+  assert_safe_diagnostics
+  ! grep -Fqi -- claim "$CAPTURE_STDERR"
+}
+
+@test "WAL exclusive locking mode is runtime_error without a claim diagnostic" {
+  init_ready
+  start_sqlite_read_lock WAL
+  export AGMSG_BUSY_TIMEOUT=50
+
+  capture_receipt_command wal-busy storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 13 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = runtime_error ]
+  assert_safe_diagnostics
+  ! grep -Fqi -- claim "$CAPTURE_STDERR"
 }
 
 @test "Git Bash rejects receipt initialization as unsupported while legacy storage stays available" {
