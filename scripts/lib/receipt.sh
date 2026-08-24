@@ -14,6 +14,32 @@ _AGMSG_RECEIPT_SKILL_DIR="$(cd "$_AGMSG_RECEIPT_LIB_DIR/../.." && pwd)"
 
 _agmsg_receipt_error() { printf 'agmsg receipt: %s\n' "$1" >&2; }
 
+# Receipt read probes need both `.bail on` and an explicit backend outcome.
+# Their stderr is captured only for classification and is never re-emitted:
+# sqlite3 diagnostics can contain database paths. 13 is reserved for a
+# transient busy/locked backend; every other failed read is invalid state.
+_agmsg_receipt_sqlite_read() {
+  local db="$1" sql="$2" result status
+  if result="$(
+      printf '.bail on\n%s\n' "$sql" |
+        LC_ALL=C agmsg_sqlite -batch "$db" 2>&1
+    )"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    case "$result" in
+      *'database is locked'*|*'database table is locked'*|*'database schema is locked'*)
+        return 13
+        ;;
+      *) return 12 ;;
+    esac
+  fi
+  result="$(printf '%s' "$result" | /usr/bin/tr -d '\r')" || return 13
+  printf '%s' "$result"
+}
+
 _agmsg_receipt_control_result() {
   local status="$1"
   case "$status" in
@@ -107,7 +133,7 @@ _agmsg_receipt_validate_store() {
 }
 
 _agmsg_receipt_capability_claim_check() {
-  local team="$1" db description count capabilities old_ifs token seen=
+  local team="$1" db description count capabilities old_ifs token seen='' rc
 
   if [ -e "$_AGMSG_RECEIPT_SKILL_DIR/scripts/lib/claims.sh" ] ||
      [ -L "$_AGMSG_RECEIPT_SKILL_DIR/scripts/lib/claims.sh" ]; then
@@ -160,12 +186,17 @@ _agmsg_receipt_capability_claim_check() {
   IFS="$old_ifs"
 
   db="$(_agmsg_receipt_db "$team")" || return 12
-  count="$(agmsg_sqlite "$db" \
-    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='claims';" \
-    2>/dev/null | tr -d '\r')" || {
-    _agmsg_receipt_error 'cannot inspect SQLite claim capability'
+  count="$(_agmsg_receipt_sqlite_read "$db" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='claims';")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 13 ]; then
+      _agmsg_receipt_error 'SQLite backend is busy'
+      return 13
+    fi
+    _agmsg_receipt_error 'cannot inspect SQLite capability metadata'
     return 12
-  }
+  fi
   case "$count" in
     0) return 0 ;;
     1)
@@ -180,12 +211,14 @@ _agmsg_receipt_capability_claim_check() {
 }
 
 _agmsg_receipt_state_kind() {
-  local db="$1" result
-  result="$(agmsg_sqlite "$db" "
+  local db="$1" result status
+  result="$(_agmsg_receipt_sqlite_read "$db" "
     SELECT
       (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='receipt_meta') || ':' ||
       (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='receipt_nonces');
-  " 2>/dev/null | tr -d '\r')" || return 1
+  ")"
+  status=$?
+  [ "$status" -eq 0 ] || return "$status"
   case "$result" in
     0:0) printf '%s\n' absent ;;
     1:1) printf '%s\n' ready ;;
@@ -194,8 +227,8 @@ _agmsg_receipt_state_kind() {
 }
 
 _agmsg_receipt_schema_valid() {
-  local db="$1" result
-  result="$(agmsg_sqlite "$db" "
+  local db="$1" result status
+  result="$(_agmsg_receipt_sqlite_read "$db" "
     SELECT CASE WHEN
       (SELECT group_concat(name || ':' || type || ':' || \"notnull\" || ':' || pk, ',')
          FROM (SELECT name,type,\"notnull\",pk FROM pragma_table_info('receipt_meta') ORDER BY cid))
@@ -222,8 +255,10 @@ _agmsg_receipt_schema_valid() {
             OR typeof(expires_at)!='integer' OR typeof(committed_at)!='integer'
       )
     THEN 1 ELSE 0 END;
-  " 2>/dev/null | tr -d '\r')" || return 1
-  [ "$result" = 1 ]
+  ")"
+  status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  [ "$result" = 1 ] || return 12
 }
 
 _agmsg_receipt_public_fingerprint() {
@@ -238,41 +273,53 @@ EOF
 }
 
 _agmsg_receipt_keys_valid() {
-  local team="$1" private public db tmp derived actual expected
+  local team="$1" private public db tmp derived actual expected status cleanup_status=0
   private="$(_agmsg_receipt_private_key "$team")"
   public="$(_agmsg_receipt_public_key "$team")"
   db="$(_agmsg_receipt_db "$team")"
-  _agmsg_receipt_validate_file "$private" 600 || return 1
-  _agmsg_receipt_validate_file "$public" 600 || return 1
+  _agmsg_receipt_validate_file "$private" 600 || return 12
+  _agmsg_receipt_validate_file "$public" 600 || return 12
 
-  tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-keycheck.XXXXXX")" ||
-    return 1
-  /bin/chmod 700 "$tmp" || { /bin/rm -rf -- "$tmp"; return 1; }
+  tmp="$(/usr/bin/mktemp -d \
+    "${TMPDIR:-/tmp}/agmsg-receipt-keycheck.XXXXXX" 2>/dev/null)" ||
+    return 13
+  /bin/chmod 700 "$tmp" 2>/dev/null || {
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    return 13
+  }
   derived="$tmp/public.pem"
   if ! "$AGMSG_RECEIPT_OPENSSL_RESOLVED" pkey -in "$private" -pubout \
       -out "$derived" >/dev/null 2>&1 ||
      ! /usr/bin/cmp -s "$derived" "$public"; then
-    /bin/rm -rf -- "$tmp"
-    return 1
+    /bin/rm -rf -- "$tmp" 2>/dev/null || cleanup_status=1
+    [ "$cleanup_status" -eq 0 ] || return 13
+    return 12
   fi
-  /bin/rm -rf -- "$tmp"
+  /bin/rm -rf -- "$tmp" 2>/dev/null || return 13
 
-  actual="$(_agmsg_receipt_public_fingerprint "$public")" || return 1
-  expected="$(agmsg_sqlite "$db" \
-    "SELECT value FROM receipt_meta WHERE key='public_key_sha256';" \
-    2>/dev/null | tr -d '\r')" || return 1
-  [ "$actual" = "$expected" ]
+  actual="$(_agmsg_receipt_public_fingerprint "$public")" || return 12
+  expected="$(_agmsg_receipt_sqlite_read "$db" \
+    "SELECT value FROM receipt_meta WHERE key='public_key_sha256';")"
+  status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  [ "$actual" = "$expected" ] || return 12
 }
 
 _agmsg_receipt_validate_ready() {
-  local team="$1" dir db kind
+  local team="$1" dir db kind status
   dir="$(_agmsg_receipt_dir "$team")"
   db="$(_agmsg_receipt_db "$team")"
   _agmsg_receipt_validate_store "$team" || return $?
-  kind="$(_agmsg_receipt_state_kind "$db")" || {
-    _agmsg_receipt_error 'cannot inspect receipt schema'
-    return 12
-  }
+  kind="$(_agmsg_receipt_state_kind "$db")"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 13 ]; then
+      _agmsg_receipt_error 'SQLite backend is busy'
+    else
+      _agmsg_receipt_error 'cannot inspect receipt schema'
+    fi
+    return "$status"
+  fi
   if [ "$kind" = absent ]; then
     _agmsg_receipt_error 'receipt state is not initialized'
     [ ! -e "$dir" ] && [ ! -L "$dir" ] && return 13
@@ -286,14 +333,26 @@ _agmsg_receipt_validate_ready() {
     _agmsg_receipt_error 'receipt directory integrity check failed'
     return 12
   }
-  _agmsg_receipt_schema_valid "$db" || {
-    _agmsg_receipt_error 'receipt schema or nonce state is invalid'
-    return 12
-  }
-  _agmsg_receipt_keys_valid "$team" || {
-    _agmsg_receipt_error 'receipt key state is invalid'
-    return 12
-  }
+  _agmsg_receipt_schema_valid "$db"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 13 ]; then
+      _agmsg_receipt_error 'SQLite backend is busy'
+    else
+      _agmsg_receipt_error 'receipt schema or nonce state is invalid'
+    fi
+    return "$status"
+  fi
+  _agmsg_receipt_keys_valid "$team"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 13 ]; then
+      _agmsg_receipt_error 'cannot validate receipt key state'
+    else
+      _agmsg_receipt_error 'receipt key state is invalid'
+    fi
+    return "$status"
+  fi
 }
 
 _AGMSG_RECEIPT_INIT_LOCK=
@@ -577,7 +636,7 @@ storage_receipt_status() (
     rc=$?; _agmsg_receipt_control_result "$rc"; exit $?
   }
   agmsg_receipt_resolve_runtime || {
-    _agmsg_receipt_control_result 10; exit $?
+    rc=$?; _agmsg_receipt_control_result "$rc"; exit $?
   }
   _agmsg_receipt_capability_claim_check "$team" || {
     rc=$?; _agmsg_receipt_control_result "$rc"; exit $?
@@ -617,7 +676,7 @@ storage_receipt_init() (
     rc=$?; _agmsg_receipt_control_result "$rc"; exit $?
   }
   agmsg_receipt_resolve_runtime || {
-    _agmsg_receipt_control_result 10; exit $?
+    rc=$?; _agmsg_receipt_control_result "$rc"; exit $?
   }
   _agmsg_receipt_capability_claim_check "$team" || {
     rc=$?; _agmsg_receipt_control_result "$rc"; exit $?
@@ -651,11 +710,17 @@ storage_receipt_init() (
     rc=$?; _agmsg_receipt_control_result "$rc"; exit $?
   }
 
-  kind="$(_agmsg_receipt_state_kind "$db")" || {
-    _agmsg_receipt_error 'cannot inspect receipt schema'
-    _agmsg_receipt_control_result 12
+  kind="$(_agmsg_receipt_state_kind "$db")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 13 ]; then
+      _agmsg_receipt_error 'SQLite backend is busy'
+    else
+      _agmsg_receipt_error 'cannot inspect receipt schema'
+    fi
+    _agmsg_receipt_control_result "$rc"
     exit $?
-  }
+  fi
   case "$kind" in
     ready)
       _agmsg_receipt_validate_ready "$team"
