@@ -22,6 +22,9 @@ summary/list/show operations with SQLite/JSONL parity.
 - Focused tests prove opaque IDs, legacy SQLite IDs, byte/item boundaries,
   multibyte/control-like bodies, later-row inspection, failure framing, and
   SQLite/JSONL parity.
+- Every completed bounded JSON record is capped at 8,192 bytes by default,
+  configurable up to 65,536 bytes; boundary/+1 overflow fails with zero stdout,
+  bounded stderr, and no durable mutation.
 - Driver-interface documentation records the lower-level contract and the
   unresolved upper-layer contracts remain explicitly out of scope.
 
@@ -31,6 +34,9 @@ summary/list/show operations with SQLite/JSONL parity.
 - Do not synchronize, reset, force-push, or rewrite fork `main`.
 - Preserve the existing `storage_*` ABI, stdout framing, legacy behavior, and
   opaque stored IDs. Do not define an ID transport grammar or new ID maximum.
+- Treat `AGMSG_BOUNDED_MAX_RECORD_BYTES` only as a completed-output-record
+  safety policy. It does not authorize downstream `.agents` use, a dependency
+  pin, or runtime activation before the separate ID transport decision.
 - The operation must not call existing initialization/migration helpers on a
   read path. Capture and validate the complete candidate snapshot before any
   stdout is emitted.
@@ -61,7 +67,12 @@ existing storage driver facade.
    framing, and zero stdout on validation/driver failures.
 3. Add SQLite-only coverage for a legacy decimal ID and JSONL-only coverage for
    malformed metadata/nested-event projection where the backing formats differ.
-4. Run `rtk bats tests/test_bounded_storage.bats` and the same command with
+4. Add review regressions for JSONL pre-marker virtual adoption, cross-driver
+   timestamp/stable-tie ordering, duplicate IDs, 8,192/+1 encoded-record bytes,
+   the 65,536 policy maximum, final-emitter failure, and metadata-only summary
+   aggregation. Every failure path verifies zero stdout where required and no
+   durable mutation.
+5. Run `rtk bats tests/test_bounded_storage.bats` and the same command with
    `AGMSG_STORAGE_DRIVER=jsonl`; confirm the new tests fail because the three
    functions do not yet exist (RED), while the existing storage contract remains
    green.
@@ -125,9 +136,12 @@ existing storage driver facade.
 
 1. Document operation signatures, defaults, result/error record fields, exit
    framing, no-mutation guarantee, and snapshot/validation behavior.
-2. Explicitly list public CLI framing, ID transport/maximum, receipt/ack,
+2. Document the completed-record policy separately from the opaque ID contract:
+   default 8,192 bytes, configured maximum 65,536, compact JSON bytes excluding
+   the trailing newline, and fail-closed zero-stdout behavior before emission.
+3. Explicitly list public CLI framing, ID transport/maximum, receipt/ack,
    JSONL crash recovery, and `#373` precedence as later decisions.
-3. Run `bash -n` on changed shell scripts, focused suites for both drivers,
+4. Run `bash -n` on changed shell scripts, focused suites for both drivers,
    existing storage suites for both drivers, and the repository’s full
    `rtk bats tests/` gate. Record sandbox-caused failures separately from code
    failures; do not claim a green full gate when it cannot run.

@@ -47,6 +47,53 @@ json_result() {
   printf '%s\n' "$1" | tail -1 | jq -e 'select(.type == "bounded_unread_result")'
 }
 
+reset_bounded_store() {
+  remove_store
+  storage_init agsuite >/dev/null
+}
+
+repeat_char() {
+  local count="$1" char="$2"
+  [ "$count" -gt 0 ] || return 0
+  printf '%*s' "$count" '' | tr ' ' "$char"
+}
+
+append_fixture_message() {
+  local id="$1" body="$2" at="$3"
+  case "${AGMSG_STORAGE_DRIVER:-sqlite}" in
+    jsonl)
+      jq -cn --arg id "$id" --arg body "$body" --arg at "$at" \
+        '{type:"message_sent",id:$id,team:"agsuite",from:"alice",to:"bob",body:$body,at:$at}' \
+        >> "$(store_dir)/events.jsonl"
+      ;;
+    *)
+      local db id_sql body_sql at_sql
+      db="$(agmsg_db_path agsuite)"
+      id_sql="$(agmsg_sqlesc "$id")"
+      body_sql="$(agmsg_sqlesc "$body")"
+      at_sql="$(agmsg_sqlesc "$at")"
+      agmsg_sqlite "$db" "INSERT INTO events(type,id,team,from_agent,to_agent,body,at)
+        VALUES('message_sent','$id_sql','agsuite','alice','bob','$body_sql','$at_sql');" >/dev/null
+      ;;
+  esac
+}
+
+opaque_id_for_record_bytes() {
+  local target="$1" empty_record base_bytes id_bytes
+  empty_record="$(jq -cn '{type:"message_sent",id:"",team:"agsuite",from:"alice",to:"bob",body:"x",at:"2026-01-01T00:00:00Z"}')"
+  base_bytes="$(printf '%s' "$empty_record" | wc -c | tr -d ' ')"
+  id_bytes=$((target - base_bytes))
+  [ "$id_bytes" -ge 1 ] || return 1
+  repeat_char "$id_bytes" i
+}
+
+assert_bounded_stderr() {
+  local file="$1" bytes
+  [ -s "$file" ]
+  bytes="$(wc -c < "$file" | tr -d ' ')"
+  [ "$bytes" -le 256 ]
+}
+
 @test "bounded summary observes a missing store without creating it" {
   remove_store
   local before after
@@ -307,6 +354,195 @@ json_result() {
   run storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 4096
   [ "$status" -eq 0 ]
   [ "$(printf '%s' "$output" | head -1 | jq -r '.id')" = opaque/nested ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "jsonl bounded reads virtually adopt a pre-marker log by message ordinal without mutation" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ] || skip "jsonl-specific adoption"
+  remove_store
+  local log; log="$(store_dir)/events.jsonl"
+  append_fixture_message adopted-1 first '2026-01-01T00:00:00Z'
+  printf '%s\n' '{"type":"team_joined","id":"side-event","team":"agsuite","agent":"alice","at":"2026-01-01T00:00:01Z"}' >> "$log"
+  append_fixture_message adopted-2 second '2026-01-01T00:00:02Z'
+
+  local before after
+  before="$(store_fingerprint)"
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.unread_count')" = 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.newest_id')" = null ]
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  [ "$(json_count "$output")" = 0 ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+  [ ! -e "$(store_dir)/.read-cursor-v1" ]
+  [ ! -e "$(store_dir)/read-cursors.tsv" ]
+}
+
+@test "bounded list and summary use the same timestamp and stable-tie order in both drivers" {
+  append_fixture_message order-late late '2026-01-01T00:00:03Z'
+  append_fixture_message order-early early '2026-01-01T00:00:00Z'
+  append_fixture_message order-tie-a tie-a '2026-01-01T00:00:01Z'
+  append_fixture_message order-tie-b tie-b '2026-01-01T00:00:01Z'
+
+  local before after ids
+  before="$(store_fingerprint)"
+  run storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096
+  [ "$status" -eq 0 ]
+  ids="$(printf '%s\n' "$output" | jq -r 'select(.type=="message_sent") | .id' | paste -sd, -)"
+  [ "$ids" = order-early,order-tie-a,order-tie-b,order-late ]
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.newest_id')" = order-late ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "duplicate opaque IDs fail before stdout and do not mutate the store" {
+  append_fixture_message duplicate-id first '2026-01-01T00:00:00Z'
+  append_fixture_message duplicate-id second '2026-01-01T00:00:01Z'
+  local before after out="$TEST_SKILL_DIR/duplicate.stdout" err="$TEST_SKILL_DIR/duplicate.stderr"
+  before="$(store_fingerprint)"
+  if storage_list_unread_bounded agsuite bob --limit-items 10 --max-body-bytes 4096 >"$out" 2>"$err"; then
+    false
+  fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "one JSON message record accepts 8192 bytes and rejects 8193 bytes including an opaque ID" {
+  export AGMSG_BOUNDED_MAX_RECORD_BYTES=8192
+  local id out="$TEST_SKILL_DIR/record.stdout" err="$TEST_SKILL_DIR/record.stderr"
+  local before after first_bytes
+
+  id="$(opaque_id_for_record_bytes 8192)"
+  append_fixture_message "$id" x '2026-01-01T00:00:00Z'
+  before="$(store_fingerprint)"
+  storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 1 >"$out" 2>"$err"
+  [ ! -s "$err" ]
+  first_bytes="$(sed -n '1p' "$out" | wc -c | tr -d ' ')"
+  [ "$first_bytes" -eq 8193 ]
+  [ "$(sed -n '1p' "$out" | jq -r '.id')" = "$id" ]
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+
+  reset_bounded_store
+  id="$(opaque_id_for_record_bytes 8193)"
+  append_fixture_message "$id" x '2026-01-01T00:00:00Z'
+  before="$(store_fingerprint)"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 1 >"$out" 2>"$err"; then
+    false
+  fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "bounded record policy accepts 65536 and rejects 65537 with zero stdout" {
+  local before after out="$TEST_SKILL_DIR/policy.stdout" err="$TEST_SKILL_DIR/policy.stderr"
+  before="$(store_fingerprint)"
+  export AGMSG_BOUNDED_MAX_RECORD_BYTES=65536
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.type')" = unread_summary ]
+
+  export AGMSG_BOUNDED_MAX_RECORD_BYTES=65537
+  if storage_unread_summary agsuite bob >"$out" 2>"$err"; then
+    false
+  fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "bounded public output failures return non-zero without durable mutation" {
+  local id before after out="$TEST_SKILL_DIR/output.stdout" err="$TEST_SKILL_DIR/output.stderr"
+  id="$(storage_send agsuite alice bob output-failure)"
+  before="$(store_fingerprint)"
+
+  # Fail only the final public emitter. Internal printf calls still work, so
+  # this distinguishes a consumer write failure from a query/render failure.
+  printf() {
+    if [ "$1" = '%s\n' ]; then
+      case "${FUNCNAME[1]:-}" in
+        _sqlite_bounded_public_result|_jsonl_bounded_emit|storage_get_message_bounded)
+          return 1
+          ;;
+      esac
+    fi
+    command printf "$@"
+  }
+
+  if storage_unread_summary agsuite bob >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  : > "$err"
+  if storage_list_unread_bounded agsuite bob --limit-items 1 --max-body-bytes 4096 >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+  : > "$err"
+  if storage_get_message_bounded agsuite bob "$id" --max-body-bytes 4096 >"$out" 2>"$err"; then false; fi
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
+@test "sqlite bounded public result does not mask a final emitter failure" {
+  [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = sqlite ] || skip "sqlite-specific emitter"
+  local payload out="$TEST_SKILL_DIR/sqlite-emitter.stdout" err="$TEST_SKILL_DIR/sqlite-emitter.stderr" rc
+  payload=$'{"type":"__agmsg_bounded_status","status":"ok"}\n{"type":"bounded_unread_result","selected_count":0}'
+  printf() {
+    if [ "$1" = '%s\n' ] && [[ "${2:-}" = '{"type":"bounded_unread_result"'* ]]; then
+      return 1
+    fi
+    command printf "$@"
+  }
+
+  set +e
+  _sqlite_bounded_public_result "$payload" ok >"$out" 2>"$err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ]
+  [ ! -s "$out" ]
+  assert_bounded_stderr "$err"
+}
+
+@test "bounded summary projects metadata before aggregation" {
+  local large before after
+  large="$(repeat_char 20000 x)"
+  append_fixture_message summary-large-body "$large" '2026-01-01T00:00:00Z'
+  before="$(store_fingerprint)"
+
+  if [ "${AGMSG_STORAGE_DRIVER:-sqlite}" = jsonl ]; then
+    local log; log="$(store_dir)/events.jsonl"
+    jq() {
+      local arg saw_slurp=0
+      for arg in "$@"; do [ "$arg" = -s ] && saw_slurp=1; done
+      if [ "$saw_slurp" -eq 1 ]; then
+        for arg in "$@"; do [ "$arg" = "$log" ] && return 97; done
+      fi
+      command jq "$@"
+    }
+  else
+    local summary_sql
+    summary_sql="$(_sqlite_bounded_summary_sql agsuite bob 8192)"
+    [[ "$summary_sql" != *"e.body AS body"* ]]
+    [[ "$summary_sql" != *"m.body AS body"* ]]
+  fi
+
+  run storage_unread_summary agsuite bob
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s' "$output" | jq -r '.unread_count')" = 1 ]
+  [ "$(printf '%s' "$output" | jq -e 'has("body") | not')" = true ]
+  [ "$(printf '%s' "$output" | wc -c | tr -d ' ')" -le 256 ]
   after="$(store_fingerprint)"
   [ "$after" = "$before" ]
 }
