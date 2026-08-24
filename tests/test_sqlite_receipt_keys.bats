@@ -907,6 +907,25 @@ assert_crash_marker() {
   [ "$after" = "$before" ]
 }
 
+@test "malformed OpenSSL probe output is runtime_error rather than missing_deps" {
+  init_ready
+  local fake="$BATS_TEST_TMPDIR/openssl-empty-version" before after
+  before="$(store_fingerprint)"
+  printf '%s\n' '#!/bin/bash' \
+    'printf "%s\n" "$DIAGNOSTIC_SECRET_FRAGMENT" >&2' \
+    'if [ "${1:-}" = version ]; then printf "\n"; exit 0; fi' \
+    'exit 1' >"$fake"
+  chmod 700 "$fake"
+  export AGMSG_RECEIPT_OPENSSL="$fake"
+
+  capture_receipt_command malformed-openssl-output storage_receipt_status receipts
+  [ "$CAPTURE_STATUS" -eq 13 ]
+  [ "$(cat "$CAPTURE_STDOUT")" = runtime_error ]
+  assert_safe_diagnostics
+  after="$(store_fingerprint)"
+  [ "$after" = "$before" ]
+}
+
 @test "xxd capability refusal sanitizes underlying stderr and leaves state unchanged" {
   init_ready
   local fake="$BATS_TEST_TMPDIR/xxd-fail" before after
