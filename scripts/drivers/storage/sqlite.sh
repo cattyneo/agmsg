@@ -858,12 +858,15 @@ _sqlite_receipt_ack_transaction() {
       'waiting=${AGMSG_RECEIPT_GATE_WAITING-}' \
       'verdict=${AGMSG_RECEIPT_GATE_VERDICT-}' \
       'parent=${AGMSG_RECEIPT_GATE_PARENT_PID-}' \
+      'instance_id_lib=${AGMSG_RECEIPT_INSTANCE_ID_LIB-}' \
       'case "$waiting:$verdict" in /*:/*) ;; *) exit 1 ;; esac' \
+      'case "$instance_id_lib" in /*) ;; *) exit 1 ;; esac' \
       'case "$parent" in ""|*[!0-9]*|0*) exit 1 ;; esac' \
+      '. "$instance_id_lib" || exit 1' \
       ': >"$waiting" || exit 1' \
       'attempt=0' \
       'while [ ! -f "$verdict" ]; do' \
-      '  kill -0 "$parent" 2>/dev/null || exit 1' \
+      '  _agmsg_pid_alive_local "$parent" || exit 1' \
       '  attempt=$((attempt + 1)); [ "$attempt" -le 1000 ] || exit 1' \
       '  sleep 0.01' \
       'done' >"$gate" ) || { /bin/rm -rf -- "$tmp"; return 13; }
@@ -958,14 +961,15 @@ _sqlite_receipt_ack_transaction() {
   local AGMSG_RECEIPT_GATE_WAITING="$waiting"
   local AGMSG_RECEIPT_GATE_VERDICT="$verdict"
   local AGMSG_RECEIPT_GATE_PARENT_PID="$_AGMSG_RECEIPT_GATE_PARENT_PID"
+  local AGMSG_RECEIPT_INSTANCE_ID_LIB="$_AGMSG_RECEIPT_LIB_DIR/instance-id.sh"
   export AGMSG_RECEIPT_GATE_SCRIPT AGMSG_RECEIPT_GATE_WAITING AGMSG_RECEIPT_GATE_VERDICT \
-    AGMSG_RECEIPT_GATE_PARENT_PID
+    AGMSG_RECEIPT_GATE_PARENT_PID AGMSG_RECEIPT_INSTANCE_ID_LIB
   LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" >"$output" 2>"$error" &
   sqlite_pid=$!
   attempt=0
   while [ ! -f "$waiting" ]; do
     attempt=$((attempt + 1))
-    if [ "$attempt" -gt 1000 ] || ! kill -0 "$sqlite_pid" 2>/dev/null; then
+    if [ "$attempt" -gt 1000 ] || ! _agmsg_pid_alive_local "$sqlite_pid"; then
       break
     fi
     sleep 0.01

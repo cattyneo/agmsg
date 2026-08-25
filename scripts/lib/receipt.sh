@@ -11,6 +11,8 @@ _AGMSG_RECEIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _AGMSG_RECEIPT_SKILL_DIR="$(cd "$_AGMSG_RECEIPT_LIB_DIR/../.." && pwd)"
 # shellcheck disable=SC1091
 . "$_AGMSG_RECEIPT_LIB_DIR/receipt-runtime.sh"
+# shellcheck disable=SC1091
+. "$_AGMSG_RECEIPT_LIB_DIR/instance-id.sh"
 
 _agmsg_receipt_error() { printf 'agmsg receipt: %s\n' "$1" >&2; }
 
@@ -1038,13 +1040,7 @@ EOF
 # requires positive absence from the process table as well; an unobservable PID
 # is conservatively treated as live/unknown and never removed.
 _agmsg_receipt_pid_is_live_or_unknown() {
-  local pid="$1" error
-  kill -0 "$pid" 2>/dev/null && return 0
-  error="$(export LC_ALL=C; kill -0 "$pid" 2>&1)"
-  case "$error" in
-    *[Nn]'o such process'*) return 1 ;;
-    *) return 0 ;;
-  esac
+  _agmsg_pid_alive_local "$1"
 }
 
 _agmsg_receipt_lock_file_valid() {
