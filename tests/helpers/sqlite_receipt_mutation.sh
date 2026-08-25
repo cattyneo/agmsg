@@ -251,9 +251,9 @@ receipt_apply_mutation() {
         'return 1' || return 1
       ;;
     no-two-link-init-race)
-      _receipt_mutation_rewrite_nth "$receipt" \
-        '_agmsg_receipt_lock_file_valid "$stage" '\''1:2'\'' || return 12' \
-        '_agmsg_receipt_lock_file_valid "$stage" 1 || return 12' 1 || return 1
+      _receipt_mutation_rewrite "$receipt" \
+        '_agmsg_receipt_lock_file_valid "$stage" '\''1:2'\'' || {' \
+        '_agmsg_receipt_lock_file_valid "$stage" 1 || {' || return 1
       ;;
     no-stage-validation-retry)
       _receipt_mutation_rewrite_nth "$receipt" \
