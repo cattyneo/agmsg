@@ -1022,6 +1022,228 @@ SH
   [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';")" = 0 ]
 }
 
+@test "Task 4 private precommit verdict publication failure is one bounded refusal" {
+  ack_abi_required
+  sql_event verdict-publication-fault alice bob verdict-private-body-91bc4e72 \
+    2026-01-01T00:00:00Z
+  sqlite3 "$(agmsg_db_path receipts)" "
+    INSERT INTO messages(team,from_agent,to_agent,body,created_at)
+      VALUES('receipts','alice','bob','verdict-private-body-91bc4e72',
+        '2026-01-01T00:00:00Z');
+    UPDATE events SET legacy_id=last_insert_rowid()
+      WHERE id='verdict-publication-fault';"
+  local db token before stderr path
+  db="$(agmsg_db_path receipts)"; token="$(issue_list_token bob)"
+  before="$(sqlite3 "$db" "
+    SELECT 'nonce=' || COUNT(*) FROM receipt_nonces;
+    SELECT 'read=' || COUNT(*) FROM events WHERE type='message_read';
+    SELECT 'read_at=' || COALESCE(group_concat(id || ':' || COALESCE(read_at,''), ','), '')
+      FROM messages;
+    SELECT 'cursor=' || COUNT(*) || ':' || COALESCE(
+      group_concat(team || ':' || agent || ':' || local_position, ','), '')
+      FROM read_cursors;")"
+
+  # The transaction owner must treat a private temp-create/atomic-rename
+  # failure as an operational refusal.  This shell seam is the same kind of
+  # reachable fault injection used for agmsg_sqlite/OpenSSL in the surrounding
+  # receipt tests; it never exposes the private row or token.
+  _sqlite_receipt_publish_verdict() { return 71; }
+  path="$BATS_TEST_TMPDIR/verdict-publication-fault"
+  if storage_ack_receipt receipts bob --receipt "$token" >"$path.stdout" 2>"$path.stderr"; then
+    return 1
+  fi
+  [ ! -s "$path.stdout" ]
+  [ "$(wc -l <"$path.stderr" | tr -d ' ')" = 1 ]
+  [ "$(wc -c <"$path.stderr" | tr -d ' ')" -le 4096 ]
+  stderr="$(cat "$path.stderr")"
+  [ "$stderr" = 'agmsg receipt: acknowledgement failed' ]
+  refute grep -Fq -- "$token" "$path.stderr"
+  refute grep -Fq -- verdict-private-body-91bc4e72 "$path.stderr"
+  refute grep -Fq -- "$BATS_TEST_TMPDIR" "$path.stderr"
+  [ "$(sqlite3 "$db" "
+    SELECT 'nonce=' || COUNT(*) FROM receipt_nonces;
+    SELECT 'read=' || COUNT(*) FROM events WHERE type='message_read';
+    SELECT 'read_at=' || COALESCE(group_concat(id || ':' || COALESCE(read_at,''), ','), '')
+      FROM messages;
+    SELECT 'cursor=' || COUNT(*) || ':' || COALESCE(
+      group_concat(team || ':' || agent || ':' || local_position, ','), '')
+      FROM read_cursors;")" = "$before" ]
+}
+
+@test "Task 4 parent death after the waiting marker bounds the child and permits retry" {
+  ack_abi_required
+  local db token before rows snapshot selected payload_sha generation key_sha team_hex
+  local recipient_hex batch_sha frame_sha frontier issued expires nonce team_sha recipient_sha
+  local runner wrapper_dir work ack_pid ack_rc wrapper_pid i real_sqlite
+  db="$(agmsg_db_path receipts)"
+  sql_event parent-death-private-id-91bc4e72 alice bob parent-death-private-body-91bc4e72 \
+    2026-01-01T00:00:00Z
+  sqlite3 "$db" "
+    INSERT INTO messages(team,from_agent,to_agent,body,created_at)
+      VALUES('receipts','alice','bob','parent-death-private-body-91bc4e72',
+        '2026-01-01T00:00:00Z');
+    UPDATE events SET legacy_id=last_insert_rowid()
+      WHERE id='parent-death-private-id-91bc4e72';"
+  token="$(issue_list_token bob)"; decode_receipt "$token"
+  selected="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^selected_count=//p')"
+  generation="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^store_generation=//p')"
+  key_sha="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^key_sha256=//p')"
+  team_hex="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^team_hex=//p')"
+  recipient_hex="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^recipient_hex=//p')"
+  batch_sha="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^batch_sha256=//p')"
+  frame_sha="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^frame_sha256=//p')"
+  frontier="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^issuance_frontier=//p')"
+  issued="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^issued_at=//p')"
+  expires="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^expires_at=//p')"
+  nonce="$(printf '%s\n' "$RECEIPT_PAYLOAD" | sed -n 's/^nonce=//p')"
+  payload_sha="$(shasum -a 256 "$BATS_TEST_TMPDIR/payload.bin" | awk '{print $1}')"
+  printf '%s\n' "$team_hex" >"$BATS_TEST_TMPDIR/team.hex"
+  xxd -r -p "$BATS_TEST_TMPDIR/team.hex" >"$BATS_TEST_TMPDIR/team.bin"
+  team_sha="$(shasum -a 256 "$BATS_TEST_TMPDIR/team.bin" | awk '{print $1}')"
+  printf '%s\n' "$recipient_hex" >"$BATS_TEST_TMPDIR/recipient.hex"
+  xxd -r -p "$BATS_TEST_TMPDIR/recipient.hex" >"$BATS_TEST_TMPDIR/recipient.bin"
+  recipient_sha="$(shasum -a 256 "$BATS_TEST_TMPDIR/recipient.bin" | awk '{print $1}')"
+  snapshot="$(_sqlite_data_stdin receipts \
+    "$(_sqlite_receipt_ack_snapshot_sql receipts bob "$selected")")"
+  rows="$BATS_TEST_TMPDIR/parent-death.rows"
+  printf '%s\n' "$snapshot" | sed -n 's/^__agmsg_receipt_row|//p' >"$rows"
+  [ "$(wc -l <"$rows" | tr -d ' ')" = "$selected" ]
+
+  before="$(sqlite3 "$db" "
+    SELECT 'nonce=' || COUNT(*) FROM receipt_nonces;
+    SELECT 'read=' || COUNT(*) FROM events WHERE type='message_read';
+    SELECT 'read_at=' || COALESCE(group_concat(id || ':' || COALESCE(read_at,''), ','), '')
+      FROM messages;
+    SELECT 'cursor=' || COUNT(*) || ':' || COALESCE(
+      group_concat(team || ':' || agent || ':' || local_position, ','), '')
+      FROM read_cursors;")"
+
+  work="$BATS_TEST_TMPDIR/parent-death-work"; mkdir "$work"
+  wrapper_dir="$work/sqlite-wrapper"; mkdir "$wrapper_dir"
+  real_sqlite="$(command -v sqlite3)"
+  cat >"$wrapper_dir/sqlite3" <<'SH'
+#!/usr/bin/env bash
+set -u
+input="${ACK_PARENT_DEATH_WORK}/sqlite.input.$$"
+watcher=
+child_pid=
+cleanup() {
+  if [ -n "$child_pid" ]; then
+    kill "$child_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup TERM INT
+case " $* " in
+  *' -batch '*)
+    /bin/cat >"$input"
+    if grep -q 'CREATE TEMP TABLE _ack_expected' "$input" &&
+       [ -n "${AGMSG_RECEIPT_GATE_WAITING:-}" ]; then
+      (
+        while [ ! -f "$AGMSG_RECEIPT_GATE_WAITING" ]; do sleep 0.01; done
+        : >"$ACK_PARENT_DEATH_WORK/waiting-observed"
+      ) &
+      watcher=$!
+    fi
+    printf '%s' "$$" >"$ACK_PARENT_DEATH_WORK/wrapper.pid"
+    if "$REAL_ACK_SQLITE" "$@" <"$input" & then
+      child_pid=$!
+      if wait "$child_pid"; then rc=0; else rc=$?; fi
+    else
+      rc=$?
+    fi
+    [ -z "$watcher" ] || wait "$watcher" 2>/dev/null || true
+    printf '%s' "$rc" >"$ACK_PARENT_DEATH_WORK/sqlite-done"
+    tmp_dir="${AGMSG_RECEIPT_GATE_WAITING%/*}"
+    case "$tmp_dir" in
+      /*) /bin/rm -rf -- "$tmp_dir" ;;
+    esac
+    /bin/rm -f -- "$input"
+    trap - TERM INT
+    exit "$rc"
+    ;;
+  *) exec "$REAL_ACK_SQLITE" "$@" ;;
+esac
+SH
+  chmod 755 "$wrapper_dir/sqlite3"
+
+  runner="$work/run-transaction.sh"
+  cat >"$runner" <<'SH'
+#!/usr/bin/env bash
+set -u
+# shellcheck disable=SC1091
+source "$SCRIPTS/lib/storage.sh"
+agmsg_storage_load
+_agmsg_receipt_capability_claim_check() {
+  : >"$ACK_PARENT_DEATH_CLAIM_ENTERED"
+  while [ ! -f "$ACK_PARENT_DEATH_ALLOW" ]; do sleep 0.01; done
+  return 0
+}
+_sqlite_receipt_ack_transaction \
+  "$ACK_TEAM" "$ACK_RECIPIENT" "$ACK_ROWS" "$ACK_NONCE" "$ACK_PAYLOAD_SHA" \
+  "$ACK_GENERATION" "$ACK_KEY_SHA" "$ACK_TEAM_SHA" "$ACK_RECIPIENT_SHA" \
+  "$ACK_BATCH_SHA" "$ACK_FRAME_SHA" "$ACK_FRONTIER" "$ACK_ISSUED" "$ACK_EXPIRES"
+SH
+  chmod 755 "$runner"
+  export ACK_PARENT_DEATH_WORK="$work" REAL_ACK_SQLITE="$real_sqlite"
+  export ACK_PARENT_DEATH_CLAIM_ENTERED="$work/claim-entered"
+  export ACK_PARENT_DEATH_ALLOW="$work/claim-allow"
+  export ACK_TEAM=receipts ACK_RECIPIENT=bob ACK_ROWS="$rows" ACK_NONCE="$nonce"
+  export ACK_PAYLOAD_SHA="$payload_sha" ACK_GENERATION="$generation" ACK_KEY_SHA="$key_sha"
+  export ACK_TEAM_SHA="$team_sha" ACK_RECIPIENT_SHA="$recipient_sha"
+  export ACK_BATCH_SHA="$batch_sha" ACK_FRAME_SHA="$frame_sha" ACK_FRONTIER="$frontier"
+  export ACK_ISSUED="$issued" ACK_EXPIRES="$expires"
+  PATH="$wrapper_dir:$PATH"; export PATH
+
+  run_parent_transaction() {
+    exec "$runner" >"$work/runner.stdout" 2>"$work/runner.stderr"
+  }
+  run_parent_transaction &
+  ack_pid=$!
+  [ -n "$ack_pid" ]
+  for i in $(seq 1 50); do
+    [ -f "$work/waiting-observed" ] && break
+    sleep 0.1
+  done
+  [ -f "$work/waiting-observed" ]
+  kill -KILL "$ack_pid" 2>/dev/null || true
+  if wait "$ack_pid"; then ack_rc=0; else ack_rc=$?; fi
+  [ "$ack_rc" -ne 0 ]
+
+  # The old 10-second gate timeout is deliberately outside this bound.  If a
+  # mutant or regression leaves the wrapper alive, terminate that exact PID
+  # recorded by the wrapper before failing the test; never guess by command or
+  # process name.
+  for i in $(seq 1 50); do
+    [ -f "$work/sqlite-done" ] && break
+    sleep 0.1
+  done
+  if [ ! -f "$work/sqlite-done" ]; then
+    wrapper_pid="$(cat "$work/wrapper.pid" 2>/dev/null || true)"
+    case "$wrapper_pid" in
+      ''|*[!0-9]*) ;;
+      *) kill -TERM "$wrapper_pid" 2>/dev/null || true ;;
+    esac
+    return 1
+  fi
+  [ "$(cat "$work/sqlite-done")" -ne 0 ]
+  [ "$(sqlite3 "$db" "
+    SELECT 'nonce=' || COUNT(*) FROM receipt_nonces;
+    SELECT 'read=' || COUNT(*) FROM events WHERE type='message_read';
+    SELECT 'read_at=' || COALESCE(group_concat(id || ':' || COALESCE(read_at,''), ','), '')
+      FROM messages;
+    SELECT 'cursor=' || COUNT(*) || ':' || COALESCE(
+      group_concat(team || ':' || agent || ':' || local_position, ','), '')
+      FROM read_cursors;")" = "$before" ]
+
+  PATH="${PATH#"$wrapper_dir:"}"; export PATH
+  run storage_ack_receipt receipts bob --receipt "$token"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM receipt_nonces;")" = 1 ]
+  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';")" = 1 ]
+  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM messages WHERE read_at IS NOT NULL;")" = 1 ]
+}
+
 @test "Task 4 process death after commit is reconciled by the exact retry" {
   ack_abi_required
   sql_event killed alice bob body 2026-01-01T00:00:00Z

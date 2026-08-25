@@ -934,6 +934,14 @@ _agmsg_receipt_ack() (
     # Reconciliation above remains mandatory, but no second diagnostic is
     # appended after the transaction rolled back on its private deny verdict.
     [ "$transaction_rc" -eq 76 ] && exit 13
+    # A claim predicate that allowed the operation but could not publish its
+    # private verdict is a distinct operational failure.  The child gate may
+    # have timed out and removed its private directory, so emit one bounded
+    # sanitized diagnostic here after reconciliation.
+    [ "$transaction_rc" -eq 77 ] && {
+      _agmsg_receipt_ack_diagnostic failed
+      exit 13
+    }
     [ "$transaction_rc" -eq 75 ] && { _agmsg_receipt_ack_diagnostic busy; exit 13; }
     now="$(/bin/date +%s)"
     case "$now" in ''|*[!0-9]*) ;; *)

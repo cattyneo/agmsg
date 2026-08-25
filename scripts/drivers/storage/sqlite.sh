@@ -796,6 +796,20 @@ SELECT '__agmsg_receipt_row|' || (n-1) || '|' || lower(hex(CAST(team AS BLOB))) 
 SQL
 }
 
+# Publish the private pre-COMMIT verdict through a create-then-rename pair.
+# Keeping this operation behind a shell function gives the transaction owner a
+# single failure boundary: a missing verdict must never be interpreted as an
+# allow, and callers can inject either filesystem half of the pair without
+# exposing receipt rows or token material.
+_sqlite_receipt_publish_verdict() {
+  local verdict="$1" result="$2" verdict_tmp="$3"
+  if ! ( umask 077; printf '%s' "$result" >"$verdict_tmp" ) 2>/dev/null ||
+     ! /bin/mv -- "$verdict_tmp" "$verdict" 2>/dev/null; then
+    /bin/rm -f -- "$verdict_tmp" 2>/dev/null || true
+    return 13
+  fi
+}
+
 # Run the complete ack mutation in one sqlite3 invocation and one IMMEDIATE
 # transaction. Expected raw bytes are imported into a TEMP table through SQL
 # stdin; opaque IDs and bodies never enter argv or diagnostics.
@@ -806,7 +820,7 @@ _sqlite_receipt_ack_transaction() {
   local batch_sha="$1" frame_sha="$2" frontier="$3" issued="$4" expires="$5"
   local db tmp sql gate waiting verdict output error verdict_lit verdict_tmp
   local index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra
-  local cte tl al result rc=0 selected sqlite_pid attempt claim_rc=0
+  local cte tl al result rc=0 selected sqlite_pid attempt claim_rc=0 verdict_rc=0
   db="$(_sqlite_db "$team")" || return 13
   tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-sql.XXXXXX" 2>/dev/null)" || return 13
   /bin/chmod 700 "$tmp" 2>/dev/null || { /bin/rm -rf -- "$tmp"; return 13; }
@@ -820,10 +834,13 @@ _sqlite_receipt_ack_transaction() {
       'set -u' \
       'waiting=${AGMSG_RECEIPT_GATE_WAITING-}' \
       'verdict=${AGMSG_RECEIPT_GATE_VERDICT-}' \
+      'parent=${AGMSG_RECEIPT_GATE_PARENT_PID-}' \
       'case "$waiting:$verdict" in /*:/*) ;; *) exit 1 ;; esac' \
+      'case "$parent" in ""|*[!0-9]*|0*) exit 1 ;; esac' \
       ': >"$waiting" || exit 1' \
       'attempt=0' \
       'while [ ! -f "$verdict" ]; do' \
+      '  kill -0 "$parent" 2>/dev/null || exit 1' \
       '  attempt=$((attempt + 1)); [ "$attempt" -le 1000 ] || exit 1' \
       '  sleep 0.01' \
       'done' >"$gate" ) || { /bin/rm -rf -- "$tmp"; return 13; }
@@ -917,7 +934,8 @@ _sqlite_receipt_ack_transaction() {
   local AGMSG_RECEIPT_GATE_SCRIPT="$gate"
   local AGMSG_RECEIPT_GATE_WAITING="$waiting"
   local AGMSG_RECEIPT_GATE_VERDICT="$verdict"
-  export AGMSG_RECEIPT_GATE_SCRIPT AGMSG_RECEIPT_GATE_WAITING AGMSG_RECEIPT_GATE_VERDICT
+  export AGMSG_RECEIPT_GATE_SCRIPT AGMSG_RECEIPT_GATE_WAITING AGMSG_RECEIPT_GATE_VERDICT \
+    AGMSG_RECEIPT_GATE_PARENT_PID="$$"
   LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" >"$output" 2>"$error" &
   sqlite_pid=$!
   attempt=0
@@ -938,15 +956,10 @@ _sqlite_receipt_ack_transaction() {
       result=deny
     fi
     verdict_tmp="${verdict}.tmp.$$"
-    if ! ( umask 077; printf '%s' "$result" >"$verdict_tmp" ) ||
-       ! /bin/mv -- "$verdict_tmp" "$verdict"; then
-      claim_rc=13
-      /bin/rm -f -- "$verdict_tmp" 2>/dev/null || true
-    fi
+    _sqlite_receipt_publish_verdict "$verdict" "$result" "$verdict_tmp" || verdict_rc=13
   else
     verdict_tmp="${verdict}.tmp.$$"
-    ( umask 077; printf '%s' deny >"$verdict_tmp" ) 2>/dev/null &&
-      /bin/mv -- "$verdict_tmp" "$verdict" 2>/dev/null || true
+    _sqlite_receipt_publish_verdict "$verdict" deny "$verdict_tmp" 2>/dev/null || true
   fi
 
   if wait "$sqlite_pid"; then rc=0; else rc=$?; fi
@@ -954,6 +967,10 @@ _sqlite_receipt_ack_transaction() {
   if [ "$claim_rc" -ne 0 ]; then
     /bin/rm -rf -- "$tmp" 2>/dev/null || true
     return 76
+  fi
+  if [ "$verdict_rc" -ne 0 ]; then
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    return 77
   fi
   /bin/rm -rf -- "$tmp" 2>/dev/null || return 13
   [ "$rc" -eq 0 ] && [ -z "$result" ] && return 0
