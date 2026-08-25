@@ -1149,6 +1149,10 @@ _agmsg_receipt_reclaim_advanced_state() {
   rc=$?
   [ "$rc" -eq 0 ] && return 0
   [ "$rc" -eq 13 ] && return 13
+  if [ ! -e "$stage" ] && [ ! -L "$stage" ] &&
+     [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+    return 13
+  fi
   return 12
 }
 

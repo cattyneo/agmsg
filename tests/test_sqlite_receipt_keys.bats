@@ -1136,6 +1136,35 @@ assert_crash_lock_owner() {
   [ "$(file_links "$lock")" -eq 1 ]
 }
 
+@test "completed competing recovery after a dead two-link snapshot is transient" {
+  init_ready
+  local nonce=03112233445566778899aabbccddeeff stage lock
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" 99999999 "$nonce"
+  ln "$stage" "$lock"
+  _agmsg_receipt_lock_file_valid() {
+    local path="$1" allowed="$2"
+    if [ "$path" = "$lock" ] && [ "$allowed" = 2 ]; then
+      /bin/rm -f -- "$stage"
+      return 1
+    fi
+    if [ "$path" = "$lock" ] && [ "$allowed" = 1 ]; then
+      return 0
+    fi
+    [ "$path" = "$stage" ] && [ "$allowed" = '1:2' ]
+  }
+  _agmsg_receipt_lock_state() {
+    /bin/rm -f -- "$lock"
+    return 12
+  }
+  _agmsg_receipt_pid_is_live_or_unknown() { return 1; }
+
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ ! -e "$stage" ]
+  [ ! -e "$lock" ]
+}
+
 @test "initializer PID capture records the shell that owns cleanup" {
   init_ready
   local probe expected
