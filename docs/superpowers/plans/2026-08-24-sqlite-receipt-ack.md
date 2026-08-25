@@ -52,7 +52,8 @@ does not block this fork-local PR or merge.
   and no partial durable transition. A retry after an unobserved successful
   commit returns a distinct bounded `already_committed` diagnostic and directs
   the caller to unread summary reconciliation.
-- Known `fujibee/agmsg#373` capability is a hard interlock. One shared predicate
+- Known `fujibee/agmsg#373` capability is a fail-closed compatibility
+  interlock, not a cross-domain atomicity guarantee. One shared predicate
   used by status, issue, and ack rejects the exact `scripts/lib/claims.sh` file,
   known claim functions, SQLite `claims` table, or a `message-claim-*` token in
   the storage driver's versioned capability list. Malformed/duplicate tokens or

@@ -1355,7 +1355,7 @@ SH
   done
 }
 
-@test "Task 4 rechecks the repo claim marker after BEGIN immediately before COMMIT" {
+@test "Task 4 rechecks the repo claim marker after BEGIN near COMMIT" {
   ack_abi_required
   sql_event claim-race alice bob body 2026-01-01T00:00:00Z
   local token db claims_file real_sqlite before barrier lock_probe

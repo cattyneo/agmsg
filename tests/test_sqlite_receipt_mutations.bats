@@ -99,7 +99,7 @@ run_mutant_subset() {
     'weak-legacy-identity|Task 4 transaction guards the full event-linked legacy identity' \
     'unbounded-prune|Task 4 retained expiry retries reconcile' \
     'no-claim-interlock|Task 4 claim markers and a busy writer' \
-    'no-precommit-claim-interlock|Task 4 rechecks the repo claim marker after BEGIN immediately before COMMIT'
+    'no-precommit-claim-interlock|Task 4 rechecks the repo claim marker after BEGIN near COMMIT'
 }
 
 @test "Task 5 filesystem and lock mutants are killed by narrow named regressions" {
@@ -127,6 +127,6 @@ run_mutant_subset() {
     >/dev/null 2>/dev/null
 }
 
-@test "Task 5 external claim-file atomicity mutant remains blocked" {
-  skip "BLOCKED/UNRESOLVED: claims.sh is an external mutable file and cannot be committed atomically with SQLite without an owner-approved shared authority"
+@test "Task 5 external claim-file hard atomicity remains deferred" {
+  skip "DEFERRED: external claim authorities remain outside SQLite until the owner-approved shared maintenance lock in cattyneo/.agents#220 is implemented"
 }
