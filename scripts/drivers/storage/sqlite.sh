@@ -810,6 +810,24 @@ _sqlite_receipt_publish_verdict() {
   fi
 }
 
+# Bash 3.2 keeps $$ fixed across subshell functions, so it cannot identify the
+# receipt transaction owner. A short POSIX child observes its real parent PID;
+# the file avoids command substitution, which would add another subshell and
+# capture the wrong process. The caller's owner-only temp directory contains
+# the file, and the value is removed immediately after validation.
+_sqlite_receipt_capture_parent_pid() {
+  local destination="$1" parent
+  _AGMSG_RECEIPT_GATE_PARENT_PID=
+  /bin/sh -c 'printf "%s\n" "$PPID"' >"$destination" 2>/dev/null || return 13
+  IFS= read -r parent <"$destination" || {
+    /bin/rm -f -- "$destination" 2>/dev/null || true
+    return 13
+  }
+  /bin/rm -f -- "$destination" 2>/dev/null || return 13
+  case "$parent" in ''|*[!0-9]*|0*) return 13 ;; esac
+  _AGMSG_RECEIPT_GATE_PARENT_PID="$parent"
+}
+
 # Run the complete ack mutation in one sqlite3 invocation and one IMMEDIATE
 # transaction. Expected raw bytes are imported into a TEMP table through SQL
 # stdin; opaque IDs and bodies never enter argv or diagnostics.
@@ -818,12 +836,17 @@ _sqlite_receipt_ack_transaction() {
   local generation="$6" key_sha="$7" team_sha="$8" recipient_sha="$9"
   shift 9
   local batch_sha="$1" frame_sha="$2" frontier="$3" issued="$4" expires="$5"
-  local db tmp sql gate waiting verdict output error verdict_lit verdict_tmp
+  local db tmp sql gate waiting verdict output error verdict_lit verdict_tmp parent_file
   local index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra
   local cte tl al result rc=0 selected sqlite_pid attempt claim_rc=0 verdict_rc=0
   db="$(_sqlite_db "$team")" || return 13
   tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-sql.XXXXXX" 2>/dev/null)" || return 13
   /bin/chmod 700 "$tmp" 2>/dev/null || { /bin/rm -rf -- "$tmp"; return 13; }
+  parent_file="$tmp/parent.pid"
+  _sqlite_receipt_capture_parent_pid "$parent_file" || {
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    return 13
+  }
   sql="$tmp/ack.sql"; gate="$tmp/precommit-gate.sh"
   waiting="$tmp/precommit.waiting"; verdict="$tmp/precommit.verdict"
   output="$tmp/sqlite.stdout"; error="$tmp/sqlite.stderr"
@@ -934,8 +957,9 @@ _sqlite_receipt_ack_transaction() {
   local AGMSG_RECEIPT_GATE_SCRIPT="$gate"
   local AGMSG_RECEIPT_GATE_WAITING="$waiting"
   local AGMSG_RECEIPT_GATE_VERDICT="$verdict"
+  local AGMSG_RECEIPT_GATE_PARENT_PID="$_AGMSG_RECEIPT_GATE_PARENT_PID"
   export AGMSG_RECEIPT_GATE_SCRIPT AGMSG_RECEIPT_GATE_WAITING AGMSG_RECEIPT_GATE_VERDICT \
-    AGMSG_RECEIPT_GATE_PARENT_PID="$$"
+    AGMSG_RECEIPT_GATE_PARENT_PID
   LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" >"$output" 2>"$error" &
   sqlite_pid=$!
   attempt=0

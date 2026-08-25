@@ -1070,6 +1070,19 @@ SH
       FROM read_cursors;")" = "$before" ]
 }
 
+@test "Task 4 precommit gate captures the actual Bash transaction owner PID" {
+  local captured worker
+  captured="$BATS_TEST_TMPDIR/transaction-owner.pid"
+  (
+    _sqlite_receipt_capture_parent_pid "$captured"
+    printf '%s\n' "$_AGMSG_RECEIPT_GATE_PARENT_PID" >"$captured.result"
+    :
+  ) &
+  worker=$!
+  wait "$worker"
+  [ "$(cat "$captured.result")" = "$worker" ]
+}
+
 @test "Task 4 parent death after the waiting marker bounds the child and permits retry" {
   ack_abi_required
   local db token before rows snapshot selected payload_sha generation key_sha team_hex
