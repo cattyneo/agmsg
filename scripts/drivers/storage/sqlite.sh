@@ -964,7 +964,7 @@ _sqlite_receipt_ack_transaction() {
   local AGMSG_RECEIPT_INSTANCE_ID_LIB="$_AGMSG_RECEIPT_LIB_DIR/instance-id.sh"
   export AGMSG_RECEIPT_GATE_SCRIPT AGMSG_RECEIPT_GATE_WAITING AGMSG_RECEIPT_GATE_VERDICT \
     AGMSG_RECEIPT_GATE_PARENT_PID AGMSG_RECEIPT_INSTANCE_ID_LIB
-  LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" >"$output" 2>"$error" &
+  LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" >"$output" 2>"$error" 3>&- 4>&- &
   sqlite_pid=$!
   attempt=0
   while [ ! -f "$waiting" ]; do

@@ -43,7 +43,7 @@ run_mutant_regression() {
     *) test_file="$scratch/tests/test_sqlite_receipt_ack.bats" ;;
   esac
   nested="$BATS_TEST_TMPDIR/nested-$id.tap"
-  receipt_run_bounded 45 rtk bats --filter "$filter" "$test_file" >"$nested" 2>/dev/null
+  receipt_run_bounded 45 bats --filter "$filter" "$test_file" >"$nested" 2>/dev/null
   rc=$?
   # Only an ordinary Bats assertion failure kills the mutant.  A signal,
   # timeout, command/setup error, or a surviving mutant must not become false
@@ -125,7 +125,7 @@ run_mutant_subset() {
   local source
   source="$(mutation_source)"
   refute grep -R -n -E '\bRETURNING\b' "$source/scripts/drivers/storage" "$source/scripts/lib/receipt.sh"
-  rtk bats --filter 'Task 4 same-token concurrency commits once|Task 4 an injected COMMIT-boundary failure|Task 4 refuses late earlier rows|Task 4 retained expiry retries reconcile|Task 4 expiry|Git Bash rejects receipt initialization' \
+  bats --filter 'Task 4 same-token concurrency commits once|Task 4 an injected COMMIT-boundary failure|Task 4 refuses late earlier rows|Task 4 retained expiry retries reconcile|Task 4 expiry|Git Bash rejects receipt initialization' \
     "$source/tests/test_sqlite_receipt_ack.bats" "$source/tests/test_sqlite_receipt_keys.bats" \
     >/dev/null 2>/dev/null
 }

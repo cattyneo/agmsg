@@ -35,7 +35,7 @@ agmsg_receipt_runtime_candidates() {
 }
 
 _agmsg_receipt_runtime_run() {
-  "$@" &
+  "$@" 3>&- 4>&- &
   _AGMSG_RECEIPT_RUNTIME_CHILD_PID=$!
   wait "$_AGMSG_RECEIPT_RUNTIME_CHILD_PID"
   local status=$?
