@@ -99,7 +99,10 @@ run_mutant_subset() {
     'weak-legacy-identity|Task 4 transaction guards the full event-linked legacy identity' \
     'unbounded-prune|Task 4 retained expiry retries reconcile' \
     'no-claim-interlock|Task 4 claim markers and a busy writer' \
-    'no-precommit-claim-interlock|Task 4 rechecks the repo claim marker after BEGIN near COMMIT'
+    'no-precommit-claim-interlock|Task 4 rechecks the repo claim marker after BEGIN near COMMIT' \
+    'outer-shell-gate-owner|Task 4 precommit gate captures the actual Bash transaction owner PID' \
+    'silent-postauth-scope-helper|Task 4 post-auth scope helper failure emits one bounded refusal' \
+    'silent-postcommit-cleanup|Task 4 post-commit cleanup failure is observable'
 }
 
 @test "Task 5 filesystem and lock mutants are killed by narrow named regressions" {

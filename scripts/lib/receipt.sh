@@ -763,6 +763,10 @@ _agmsg_receipt_postauth_refuse() {
   _agmsg_receipt_ack_diagnostic "$reason"
 }
 
+_agmsg_receipt_ack_cleanup() {
+  /bin/rm -rf -- "$1" 2>/dev/null
+}
+
 # Authenticates and acknowledges one receipt. All token material and expected
 # raw row bytes stay in an owner-only directory; the SQLite driver receives
 # only its pathname and validated scalar hashes.
@@ -979,8 +983,11 @@ _agmsg_receipt_ack() (
     _agmsg_receipt_ack_diagnostic prefix; exit 13
   fi
   trap - EXIT HUP INT TERM
-  /bin/rm -rf -- "$tmp" 2>/dev/null || cleanup_status=$?
-  [ "$cleanup_status" -eq 0 ] || exit 13
+  _agmsg_receipt_ack_cleanup "$tmp" || cleanup_status=$?
+  [ "$cleanup_status" -eq 0 ] || {
+    _agmsg_receipt_ack_diagnostic failed
+    exit 13
+  }
   exit 0
 )
 

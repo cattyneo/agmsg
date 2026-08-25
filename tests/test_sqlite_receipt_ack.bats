@@ -1478,6 +1478,29 @@ SH
   [ "$(durable_state)" = "$before" ]
 }
 
+@test "Task 4 post-commit cleanup failure is observable and the exact retry reconciles" {
+  ack_abi_required
+  sql_event cleanup-fault alice bob private-cleanup-body-91bc4e72 \
+    2026-01-01T00:00:00Z
+  local token stderr
+  token="$(issue_list_token bob)"
+  _agmsg_receipt_ack_cleanup() {
+    /bin/rm -rf -- "$1" 2>/dev/null || true
+    return 71
+  }
+
+  assert_zero_stdout_failure cleanup-fault \
+    storage_ack_receipt receipts bob --receipt "$token"
+  stderr="$BATS_TEST_TMPDIR/cleanup-fault.stderr"
+  [ "$(wc -l <"$stderr" | tr -d ' ')" = 1 ]
+  [ "$(cat "$stderr")" = 'agmsg receipt: acknowledgement failed' ]
+  refute grep -Fq -- "$token" "$stderr"
+  refute grep -Fq -- private-cleanup-body-91bc4e72 "$stderr"
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM receipt_nonces;")" = 1 ]
+  [ "$(sqlite3 "$(agmsg_db_path receipts)" "SELECT COUNT(*) FROM events WHERE type='message_read';")" = 1 ]
+  [ "$(ack_failure_text cleanup-retry bob "$token")" = 'agmsg receipt: already_committed' ]
+}
+
 @test "Task 4 transaction-time expiry is classified after reconciliation" {
   ack_abi_required
   sql_event expiry-barrier alice bob body 2026-01-01T00:00:00Z

@@ -265,6 +265,21 @@ receipt_apply_mutation() {
         'if _agmsg_receipt_capability_claim_check "$team"; then' \
         'if true; then' || return 1
     ;;
+    outer-shell-gate-owner)
+      _receipt_mutation_rewrite "$sqlite" \
+        '_AGMSG_RECEIPT_GATE_PARENT_PID="$parent"' \
+        '_AGMSG_RECEIPT_GATE_PARENT_PID="$$"' || return 1
+    ;;
+    silent-postauth-scope-helper)
+      _receipt_mutation_insert_after "$receipt" \
+        'expected_team="$(_agmsg_receipt_scope_hex "$team" "$tmp/team-actual.hex")" || {' \
+        '    exit 13' || return 1
+    ;;
+    silent-postcommit-cleanup)
+      _receipt_mutation_rewrite_nth "$receipt" \
+        '[ "$cleanup_status" -eq 0 ] || {' \
+        '[ "$cleanup_status" -eq 0 ] || { exit 13;' 2 || return 1
+    ;;
     jsonl-accepts-receipt)
       _receipt_mutation_rewrite "$root/scripts/lib/storage.sh" \
         "printf 'storage: unknown bounded read option\\n' >&2" \
