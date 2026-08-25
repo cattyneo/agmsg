@@ -1133,19 +1133,40 @@ SH
   done
 }
 
-@test "Task 4 rechecks the repo claim marker after BEGIN before mutation" {
-  skip "blocked: mutable repo-file claim marker cannot be atomic with SQLite COMMIT without owner-approved shared authority"
+@test "Task 4 rechecks the repo claim marker after BEGIN immediately before COMMIT" {
   ack_abi_required
   sql_event claim-race alice bob body 2026-01-01T00:00:00Z
-  local token db claims_file real_sqlite
-  token="$(issue_list_token bob)"; db="$(agmsg_db_path receipts)"
+  local token db claims_file real_sqlite before barrier lock_probe
+  token="$(issue_list_token bob)"; db="$(agmsg_db_path receipts)"; before="$(durable_state)"
   claims_file="$TEST_SKILL_DIR/scripts/lib/claims.sh"; real_sqlite="$(command -v sqlite3)"
+  barrier="$BATS_TEST_TMPDIR/claim-race.precommit"; lock_probe="$BATS_TEST_TMPDIR/claim-race.locked"
+  export CLAIM_RACE_CLAIMS_FILE="$claims_file" CLAIM_RACE_DB="$db"
+  export CLAIM_RACE_REAL_SQLITE="$real_sqlite" CLAIM_RACE_BARRIER="$barrier"
+  export CLAIM_RACE_LOCK_PROBE="$lock_probe"
   agmsg_sqlite() {
     local input rc
     case " $* " in
     *' -batch '*)
       input="$BATS_TEST_TMPDIR/claim-race.sql"; cat >"$input"
-      if grep -q 'CREATE TEMP TABLE _ack_expected' "$input"; then : >"$claims_file"; fi
+      if grep -q 'CREATE TEMP TABLE _ack_expected' "$input" &&
+         [ -n "${AGMSG_RECEIPT_GATE_SCRIPT:-}" ]; then
+        printf '%s\n' '#!/bin/bash' \
+          'set -u' \
+          'if "$CLAIM_RACE_REAL_SQLITE" -cmd ".timeout 1" "$CLAIM_RACE_DB" "BEGIN IMMEDIATE; ROLLBACK;" >/dev/null 2>&1; then' \
+          '  printf unlocked >"$CLAIM_RACE_LOCK_PROBE"' \
+          'else' \
+          '  printf locked >"$CLAIM_RACE_LOCK_PROBE"' \
+          'fi' \
+          ': >"$CLAIM_RACE_CLAIMS_FILE"' \
+          ': >"$CLAIM_RACE_BARRIER"' \
+          ': >"$AGMSG_RECEIPT_GATE_WAITING"' \
+          'attempt=0' \
+          'while [ ! -f "$AGMSG_RECEIPT_GATE_VERDICT" ]; do' \
+          '  attempt=$((attempt + 1)); [ "$attempt" -le 1000 ] || exit 1' \
+          '  sleep 0.01' \
+          'done' >"$AGMSG_RECEIPT_GATE_SCRIPT"
+        chmod 700 "$AGMSG_RECEIPT_GATE_SCRIPT"
+      fi
       "$real_sqlite" "$@" <"$input"; rc=$?; return "$rc"
       ;;
     esac
@@ -1153,8 +1174,11 @@ SH
   }
   assert_zero_stdout_failure claim-race storage_ack_receipt receipts bob --receipt "$token"
   unset -f agmsg_sqlite; rm -f "$claims_file"
-  [ "$(sqlite3 "$db" 'SELECT COUNT(*) FROM receipt_nonces;')" = 0 ]
-  [ "$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='message_read';")" = 0 ]
+  [ -f "$barrier" ]
+  [ "$(cat "$lock_probe")" = locked ]
+  [ "$(cat "$BATS_TEST_TMPDIR/claim-race.stderr")" = \
+    'agmsg receipt: message claim capability conflicts with receipt state' ]
+  [ "$(durable_state)" = "$before" ]
 }
 
 @test "Task 4 exact retry reconciles a post-auth snapshot backend failure" {
