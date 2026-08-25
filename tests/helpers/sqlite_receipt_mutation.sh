@@ -288,7 +288,7 @@ receipt_apply_mutation() {
     wrong-init-owner-pid)
       _receipt_mutation_rewrite "$receipt" \
         '/bin/sh -c '\''printf "%s\n" "$PPID"'\'' >"$_AGMSG_RECEIPT_INIT_PID_FILE" 2>/dev/null || return 13' \
-        'printf "%s\n" "$(/bin/sh -c '\''printf %s "$PPID"'\'')" >"$_AGMSG_RECEIPT_INIT_PID_FILE" || return 13' || return 1
+        'printf "%s\n" "$PPID" >"$_AGMSG_RECEIPT_INIT_PID_FILE" || return 13' || return 1
       ;;
     unbounded-prune)
       _receipt_mutation_rewrite "$sqlite" \

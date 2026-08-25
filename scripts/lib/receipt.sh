@@ -63,6 +63,15 @@ _agmsg_receipt_platform() {
   esac
 }
 
+_agmsg_receipt_now() {
+  local now
+  now="$(/bin/date +%s 2>/dev/null)" || return 13
+  case "$now" in
+    0|[1-9][0-9]*) printf '%s\n' "$now" ;;
+    *) return 13 ;;
+  esac
+}
+
 _agmsg_receipt_db() { agmsg_db_path "$1"; }
 _agmsg_receipt_store_dir() { dirname "$(_agmsg_receipt_db "$1")"; }
 _agmsg_receipt_dir() { printf '%s/receipt-v1\n' "$(_agmsg_receipt_store_dir "$1")"; }
@@ -1214,25 +1223,57 @@ EOF
 }
 
 _agmsg_receipt_acquire_init_lock() {
-  local team="$1" dir lock attempt=0 created_at stat
+  local team="$1" dir lock started_at deadline now last_now created_at stat
   dir="$(_agmsg_receipt_dir "$team")"
   lock="$(_agmsg_receipt_lock "$team")"
   _AGMSG_RECEIPT_INIT_LOCK="$lock"
 
-  while [ "$attempt" -lt 100 ]; do
+  started_at="$(_agmsg_receipt_now)" || {
+    _agmsg_receipt_error 'cannot determine receipt init lock deadline'
+    return 13
+  }
+  case "$started_at" in
+    0|[1-9][0-9]*) ;;
+    *)
+      _agmsg_receipt_error 'cannot determine receipt init lock deadline'
+      return 13
+      ;;
+  esac
+  deadline=$((started_at + 5))
+  last_now="$started_at"
+
+  while :; do
+    now="$(_agmsg_receipt_now)" || {
+      _agmsg_receipt_error 'cannot determine receipt init lock deadline'
+      return 13
+    }
+    case "$now" in
+      0|[1-9][0-9]*) ;;
+      *)
+        _agmsg_receipt_error 'cannot determine receipt init lock deadline'
+        return 13
+        ;;
+    esac
+    if [ "$now" -lt "$last_now" ]; then
+      _agmsg_receipt_error 'receipt init lock clock moved backwards'
+      return 13
+    fi
+    last_now="$now"
+    [ "$now" -lt "$deadline" ] || break
+
     if [ -e "$lock" ] || [ -L "$lock" ]; then
       _agmsg_receipt_lock_state "$lock"
       case $? in
         0) continue ;;
         12) _agmsg_receipt_error 'receipt init lock state is corrupt'; return 12 ;;
-        *) attempt=$((attempt + 1)); sleep 0.05; continue ;;
+        *) sleep 0.05 || return 13; continue ;;
       esac
     fi
     _agmsg_receipt_reclaim_stages "$dir"
     case $? in
       0) ;;
       12) _agmsg_receipt_error 'receipt init staging state is corrupt'; return 12 ;;
-      *) attempt=$((attempt + 1)); sleep 0.05; continue ;;
+      *) sleep 0.05 || return 13; continue ;;
     esac
 
     _AGMSG_RECEIPT_INIT_NONCE="$("$AGMSG_RECEIPT_OPENSSL_RESOLVED" rand -hex 16 \
@@ -1262,8 +1303,7 @@ _agmsg_receipt_acquire_init_lock() {
     fi
     /bin/rm -f -- "$_AGMSG_RECEIPT_INIT_STAGE"
     _AGMSG_RECEIPT_INIT_STAGE=
-    attempt=$((attempt + 1))
-    sleep 0.05
+    sleep 0.05 || return 13
   done
   _agmsg_receipt_error 'timed out waiting for receipt init lock'
   return 13

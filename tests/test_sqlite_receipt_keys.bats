@@ -1280,6 +1280,7 @@ assert_crash_lock_owner() {
   /bin/sh -c 'printf "%s\n" "$PPID"' >"$probe"
   IFS= read -r expected <"$probe"
   [ "$_AGMSG_RECEIPT_INIT_PID" = "$expected" ]
+  [ "$_AGMSG_RECEIPT_INIT_PID" != "$PPID" ]
 }
 
 @test "live init lock is refused and never removed" {
@@ -1340,24 +1341,22 @@ assert_crash_lock_owner() {
 
 @test "initializer lock refusal uses a wall-clock deadline instead of retry count" {
   init_ready
-  local nonce=31112233445566778899aabbccddeeff lock fake_bin clock_file attempts_file
+  local nonce=31112233445566778899aabbccddeeff lock clock_file attempts_file
   local status_code attempts clock_after
   lock="$(receipt_lock)"
   write_lock_record "$lock" "$$" "$nonce"
-  fake_bin="$BATS_TEST_TMPDIR/receipt-deadline-bin"
   clock_file="$BATS_TEST_TMPDIR/receipt-deadline.clock"
   attempts_file="$BATS_TEST_TMPDIR/receipt-deadline.attempts"
-  mkdir "$fake_bin"
   printf '%s\n' 1000 >"$clock_file"
   printf '%s\n' 0 >"$attempts_file"
-  printf '%s\n' '#!/bin/bash' \
-    'clock_file="${AGMSG_TEST_RECEIPT_CLOCK:?}"' \
-    'clock="$(/bin/cat "$clock_file")"' \
-    'printf "%s\n" "$clock"' \
-    'printf "%s\n" "$((clock + 1))" >"$clock_file"' >"$fake_bin/date"
-  chmod 700 "$fake_bin/date"
   export AGMSG_TEST_RECEIPT_CLOCK="$clock_file"
   export AGMSG_TEST_RECEIPT_ATTEMPTS="$attempts_file"
+  _agmsg_receipt_now() {
+    local current
+    current="$(/bin/cat "$AGMSG_TEST_RECEIPT_CLOCK")"
+    printf '%s\n' "$current"
+    printf '%s\n' "$((current + 1))" >"$AGMSG_TEST_RECEIPT_CLOCK"
+  }
   _agmsg_receipt_lock_state() {
     local current
     current="$(/bin/cat "$AGMSG_TEST_RECEIPT_ATTEMPTS")"
@@ -1366,7 +1365,7 @@ assert_crash_lock_owner() {
   }
   sleep() { :; }
 
-  if PATH="$fake_bin:$PATH" _agmsg_receipt_acquire_init_lock receipts \
+  if _agmsg_receipt_acquire_init_lock receipts \
       >"$BATS_TEST_TMPDIR/receipt-deadline.stdout" \
       2>"$BATS_TEST_TMPDIR/receipt-deadline.stderr"; then
     status_code=0
