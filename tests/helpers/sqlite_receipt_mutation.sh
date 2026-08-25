@@ -255,6 +255,21 @@ receipt_apply_mutation() {
         '_agmsg_receipt_lock_file_valid "$stage" '\''1:2'\'' || return 12' \
         '_agmsg_receipt_lock_file_valid "$stage" 1 || return 12' 1 || return 1
       ;;
+    no-stage-validation-retry)
+      _receipt_mutation_rewrite_nth "$receipt" \
+        '[ ! -e "$stage" ] && [ ! -L "$stage" ] && return 13' \
+        'false #' 1 || return 1
+      ;;
+    no-stage-record-retry)
+      _receipt_mutation_rewrite_nth "$receipt" \
+        '[ ! -e "$stage" ] && [ ! -L "$stage" ] && return 13' \
+        'false #' 2 || return 1
+      ;;
+    no-stage-stat-retry)
+      _receipt_mutation_rewrite_nth "$receipt" \
+        '[ ! -e "$stage" ] && [ ! -L "$stage" ] && return 13' \
+        'false #' 3 || return 1
+      ;;
     no-init-transition-retry)
       _receipt_mutation_rewrite_nth "$receipt" \
         '_agmsg_receipt_reclaim_advanced_state "$stage" "$lock" "$record" "$pid"' \

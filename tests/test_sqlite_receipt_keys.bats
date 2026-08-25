@@ -385,6 +385,15 @@ start_crashable_init() {
       CRASH_WRAPPER_PID="$(awk -F= '$1 == "wrapper_pid" { print $2 }' "$RECEIPT_CRASH_MARKER")"
       if [ -n "$CRASH_WRAPPER_PID" ] && kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null; then
         register_test_pid "$CRASH_WRAPPER_PID"
+        local owner_path
+        owner_path="$(receipt_lock)"
+        if [ ! -f "$owner_path" ]; then
+          owner_path="$(find "$(receipt_dir)" -maxdepth 1 -name '.init-stage.*' -print -quit)"
+        fi
+        [ -n "$owner_path" ] && [ -f "$owner_path" ] || break
+        RECEIPT_OWNER_PID="$(awk -F= '$1 == "pid" { print $2 }' "$owner_path")"
+        [[ "$RECEIPT_OWNER_PID" =~ ^[0-9]+$ ]] || break
+        register_test_pid "$RECEIPT_OWNER_PID"
         return 0
       fi
     fi
@@ -399,10 +408,12 @@ start_crashable_init() {
 
 kill_crashable_init() {
   [ -s "$RECEIPT_CRASH_MARKER" ]
-  registered_pid_matches "$RECEIPT_INIT_PID" && kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
-  wait_for_test_owned_exit "$RECEIPT_INIT_PID" child
+  registered_pid_matches "$RECEIPT_OWNER_PID" && kill -9 "$RECEIPT_OWNER_PID" 2>/dev/null || true
+  wait_for_test_owned_exit "$RECEIPT_OWNER_PID" orphan
   registered_pid_matches "$CRASH_WRAPPER_PID" && kill -9 "$CRASH_WRAPPER_PID" 2>/dev/null || true
   wait_for_test_owned_exit "$CRASH_WRAPPER_PID" orphan
+  wait_for_test_owned_exit "$RECEIPT_INIT_PID" child
+  unregister_test_pid "$RECEIPT_OWNER_PID"
   unregister_test_pid "$RECEIPT_INIT_PID"
   unregister_test_pid "$CRASH_WRAPPER_PID"
 }
@@ -418,7 +429,7 @@ assert_crash_marker() {
 assert_crash_lock_owner() {
   local path="$1" owner
   owner="$(awk -F= '$1 == "pid" { print $2 }' "$path")"
-  [ "$owner" = "$RECEIPT_INIT_PID" ]
+  [ "$owner" = "$RECEIPT_OWNER_PID" ]
 }
 
 @test "receipt vectors are complete, byte-stable, and distinguish each bound field" {
@@ -1108,6 +1119,61 @@ assert_crash_lock_owner() {
   [ -f "$stage" ]
   [ -f "$lock" ]
   [ "$(file_links "$stage")" -eq 2 ]
+}
+
+@test "initializer stage disappearance before integrity validation is transient" {
+  init_ready
+  local nonce=06112233445566778899aabbccddeeff stage lock
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" "$$" "$nonce"
+  ln "$stage" "$lock"
+  _agmsg_receipt_lock_file_valid() {
+    if [ "$1" = "$stage" ]; then
+      /bin/rm -f -- "$stage"
+      return 1
+    fi
+    return 1
+  }
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ ! -e "$stage" ]
+  [ -f "$lock" ]
+}
+
+@test "initializer stage disappearance before owner-record read is transient" {
+  init_ready
+  local nonce=07112233445566778899aabbccddeeff stage lock
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" "$$" "$nonce"
+  ln "$stage" "$lock"
+  _agmsg_receipt_lock_file_valid() { return 0; }
+  _agmsg_receipt_lock_record() {
+    /bin/rm -f -- "$stage"
+    return 1
+  }
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ ! -e "$stage" ]
+  [ -f "$lock" ]
+}
+
+@test "initializer stage disappearance before link-count read is transient" {
+  init_ready
+  local nonce=08112233445566778899aabbccddeeff stage lock expected_stage_record
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" "$$" "$nonce"
+  ln "$stage" "$lock"
+  expected_stage_record="$$:$nonce:$(awk -F= '$1 == "created_at" { print $2 }' "$stage")"
+  _agmsg_receipt_lock_file_valid() { return 0; }
+  _agmsg_receipt_lock_record() { printf '%s\n' "$expected_stage_record"; }
+  _agmsg_receipt_stat() {
+    /bin/rm -f -- "$stage"
+    return 1
+  }
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ ! -e "$stage" ]
+  [ -f "$lock" ]
 }
 
 @test "initializer stage unlink after a two-link snapshot is a transient acquisition race" {

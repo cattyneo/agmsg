@@ -1161,14 +1161,23 @@ _agmsg_receipt_reclaim_stages() {
   lock="$dir/init.lock"
   for stage in "$dir"/.init-stage.*; do
     [ -e "$stage" ] || [ -L "$stage" ] || continue
-    _agmsg_receipt_lock_file_valid "$stage" '1:2' || return 12
-    record="$(_agmsg_receipt_lock_record "$stage")" || return 12
+    _agmsg_receipt_lock_file_valid "$stage" '1:2' || {
+      [ ! -e "$stage" ] && [ ! -L "$stage" ] && return 13
+      return 12
+    }
+    record="$(_agmsg_receipt_lock_record "$stage")" || {
+      [ ! -e "$stage" ] && [ ! -L "$stage" ] && return 13
+      return 12
+    }
     IFS=: read -r pid nonce _created <<EOF
 $record
 EOF
     suffix="${stage##*/.init-stage.}"
     [ "$suffix" = "$nonce" ] || return 12
-    stat="$(_agmsg_receipt_stat "$stage")" || return 12
+    stat="$(_agmsg_receipt_stat "$stage")" || {
+      [ ! -e "$stage" ] && [ ! -L "$stage" ] && return 13
+      return 12
+    }
     IFS=: read -r owner mode links _dev _inode <<EOF
 $stat
 EOF
