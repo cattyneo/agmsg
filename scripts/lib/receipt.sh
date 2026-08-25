@@ -1190,7 +1190,12 @@ EOF
       if _agmsg_receipt_pid_is_live_or_unknown "$pid"; then return 13; fi
       _agmsg_receipt_lock_state "$lock"
       rc=$?
-      [ "$rc" -eq 0 ] || return "$rc"
+      if [ "$rc" -ne 0 ]; then
+        _agmsg_receipt_reclaim_advanced_state "$stage" "$lock" "$record" "$pid"
+        rc=$?
+        [ "$rc" -eq 0 ] && continue
+        return "$rc"
+      fi
       continue
     fi
     if _agmsg_receipt_pid_is_live_or_unknown "$pid"; then return 13; fi

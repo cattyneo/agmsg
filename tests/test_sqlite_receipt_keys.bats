@@ -1165,6 +1165,24 @@ assert_crash_lock_owner() {
   [ ! -e "$lock" ]
 }
 
+@test "completed competing recovery after full pair validation is transient" {
+  init_ready
+  local nonce=04112233445566778899aabbccddeeff stage lock
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" 99999999 "$nonce"
+  ln "$stage" "$lock"
+  _agmsg_receipt_pid_is_live_or_unknown() { return 1; }
+  _agmsg_receipt_lock_state() {
+    /bin/rm -f -- "$stage" "$lock"
+    return 12
+  }
+
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ ! -e "$stage" ]
+  [ ! -e "$lock" ]
+}
+
 @test "initializer PID capture records the shell that owns cleanup" {
   init_ready
   local probe expected
