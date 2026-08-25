@@ -10,7 +10,7 @@ receipt_mutation_archive() {
 }
 
 # Keep each nested regression bounded.  Perl is part of the macOS base system
-# and the alarm is applied to the rtk process without logging test output.
+# and the alarm is applied to the nested test process without logging output.
 receipt_run_bounded() {
   local seconds="$1"
   shift
