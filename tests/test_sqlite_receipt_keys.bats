@@ -1110,6 +1110,32 @@ assert_crash_lock_owner() {
   [ "$(file_links "$stage")" -eq 2 ]
 }
 
+@test "initializer stage unlink after a two-link snapshot is a transient acquisition race" {
+  init_ready
+  local nonce=02112233445566778899aabbccddeeff stage lock
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" "$$" "$nonce"
+  ln "$stage" "$lock"
+  _agmsg_receipt_lock_file_valid() {
+    local path="$1" allowed="$2"
+    if [ "$path" = "$lock" ] && [ "$allowed" = 2 ]; then
+      /bin/rm -f -- "$stage"
+      return 1
+    fi
+    if [ "$path" = "$lock" ] && [ "$allowed" = 1 ]; then
+      [ -f "$lock" ] && [ ! -L "$lock" ] && [ "$(file_links "$lock")" -eq 1 ]
+      return
+    fi
+    [ "$path" = "$stage" ] && [ "$allowed" = '1:2' ]
+  }
+
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ ! -e "$stage" ]
+  [ -f "$lock" ]
+  [ "$(file_links "$lock")" -eq 1 ]
+}
+
 @test "initializer PID capture records the shell that owns cleanup" {
   init_ready
   local probe expected

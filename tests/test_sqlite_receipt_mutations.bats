@@ -38,7 +38,7 @@ run_mutant_regression() {
       ;;
   esac
   case "$id" in
-    no-db-integrity|no-receipt-dir-integrity|no-key-integrity|no-init-lock-integrity|no-dead-owner-check|no-two-link-init-race|wrong-init-owner-pid|jsonl-accepts-receipt)
+    no-db-integrity|no-receipt-dir-integrity|no-key-integrity|no-init-lock-integrity|no-dead-owner-check|no-two-link-init-race|no-init-transition-retry|wrong-init-owner-pid|jsonl-accepts-receipt)
       test_file="$scratch/tests/test_sqlite_receipt_keys.bats" ;;
     *) test_file="$scratch/tests/test_sqlite_receipt_ack.bats" ;;
   esac
@@ -113,6 +113,7 @@ run_mutant_subset() {
     'no-init-lock-integrity|init rejects an unsafe lock mode' \
     'no-dead-owner-check|live init lock is refused' \
     'no-two-link-init-race|live two-link initializer stage is busy' \
+    'no-init-transition-retry|initializer stage unlink after a two-link snapshot' \
     'wrong-init-owner-pid|initializer PID capture records the shell'
 }
 

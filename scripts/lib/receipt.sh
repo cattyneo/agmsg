@@ -1132,8 +1132,28 @@ EOF
   return 0
 }
 
+_agmsg_receipt_reclaim_advanced_state() {
+  local stage="$1" lock="$2" expected_record="$3" pid="$4" lock_record rc
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] || return 12
+  if [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+    return 13
+  fi
+  _agmsg_receipt_lock_file_valid "$lock" 1 || return 12
+  lock_record="$(_agmsg_receipt_lock_record "$lock")" || {
+    [ ! -e "$lock" ] && [ ! -L "$lock" ] && return 13
+    return 12
+  }
+  [ "$lock_record" = "$expected_record" ] || return 12
+  if _agmsg_receipt_pid_is_live_or_unknown "$pid"; then return 13; fi
+  _agmsg_receipt_lock_state "$lock"
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 13 ] && return 13
+  return 12
+}
+
 _agmsg_receipt_reclaim_stages() {
-  local dir="$1" stage lock lock_record record pid nonce _created suffix stat owner mode links _dev _inode
+  local dir="$1" stage lock lock_record record pid nonce _created suffix stat owner mode links _dev _inode rc
   lock="$dir/init.lock"
   for stage in "$dir"/.init-stage.*; do
     [ -e "$stage" ] || [ -L "$stage" ] || continue
@@ -1149,12 +1169,24 @@ EOF
 $stat
 EOF
     if [ "$links" = 2 ]; then
-      _agmsg_receipt_lock_file_valid "$lock" 2 || return 12
-      _agmsg_receipt_same_inode "$stage" "$lock" || return 12
-      lock_record="$(_agmsg_receipt_lock_record "$lock")" || return 12
+      if ! _agmsg_receipt_lock_file_valid "$lock" 2 ||
+         ! _agmsg_receipt_same_inode "$stage" "$lock"; then
+        _agmsg_receipt_reclaim_advanced_state "$stage" "$lock" "$record" "$pid"
+        rc=$?
+        [ "$rc" -eq 0 ] && continue
+        return "$rc"
+      fi
+      lock_record="$(_agmsg_receipt_lock_record "$lock")" || {
+        _agmsg_receipt_reclaim_advanced_state "$stage" "$lock" "$record" "$pid"
+        rc=$?
+        [ "$rc" -eq 0 ] && continue
+        return "$rc"
+      }
       [ "$lock_record" = "$record" ] || return 12
       if _agmsg_receipt_pid_is_live_or_unknown "$pid"; then return 13; fi
-      _agmsg_receipt_lock_state "$lock" || return $?
+      _agmsg_receipt_lock_state "$lock"
+      rc=$?
+      [ "$rc" -eq 0 ] || return "$rc"
       continue
     fi
     if _agmsg_receipt_pid_is_live_or_unknown "$pid"; then return 13; fi
