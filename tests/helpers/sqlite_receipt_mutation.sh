@@ -247,7 +247,7 @@ receipt_apply_mutation() {
       ;;
     no-dead-owner-check)
       _receipt_mutation_rewrite "$receipt" \
-        'kill -0 "$pid" 2>/dev/null && return 0' \
+        '_agmsg_pid_alive_local "$1"' \
         'return 1' || return 1
       ;;
     unbounded-prune)
