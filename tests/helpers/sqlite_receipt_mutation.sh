@@ -260,6 +260,11 @@ receipt_apply_mutation() {
         '_agmsg_receipt_capability_claim_check "$team" || return $?' \
         'true #' 2 || return 1
     ;;
+    no-precommit-claim-interlock)
+      _receipt_mutation_rewrite "$sqlite" \
+        'if _agmsg_receipt_capability_claim_check "$team"; then' \
+        'if true; then' || return 1
+    ;;
     jsonl-accepts-receipt)
       _receipt_mutation_rewrite "$root/scripts/lib/storage.sh" \
         "printf 'storage: unknown bounded read option\\n' >&2" \

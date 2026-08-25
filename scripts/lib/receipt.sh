@@ -930,6 +930,10 @@ _agmsg_receipt_ack() (
       "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
         _agmsg_receipt_ack_diagnostic already; exit 13
       }
+    # The pre-COMMIT closed predicate already emitted its one bounded refusal.
+    # Reconciliation above remains mandatory, but no second diagnostic is
+    # appended after the transaction rolled back on its private deny verdict.
+    [ "$transaction_rc" -eq 76 ] && exit 13
     [ "$transaction_rc" -eq 75 ] && { _agmsg_receipt_ack_diagnostic busy; exit 13; }
     now="$(/bin/date +%s)"
     case "$now" in ''|*[!0-9]*) ;; *)

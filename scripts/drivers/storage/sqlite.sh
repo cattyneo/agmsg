@@ -804,12 +804,31 @@ _sqlite_receipt_ack_transaction() {
   local generation="$6" key_sha="$7" team_sha="$8" recipient_sha="$9"
   shift 9
   local batch_sha="$1" frame_sha="$2" frontier="$3" issued="$4" expires="$5"
-  local db tmp sql index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra
-  local cte tl al result rc=0 selected
+  local db tmp sql gate waiting verdict output error verdict_lit verdict_tmp
+  local index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra
+  local cte tl al result rc=0 selected sqlite_pid attempt claim_rc=0
   db="$(_sqlite_db "$team")" || return 13
   tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-sql.XXXXXX" 2>/dev/null)" || return 13
   /bin/chmod 700 "$tmp" 2>/dev/null || { /bin/rm -rf -- "$tmp"; return 13; }
-  sql="$tmp/ack.sql"; ( umask 077; : >"$sql" ) || { /bin/rm -rf -- "$tmp"; return 13; }
+  sql="$tmp/ack.sql"; gate="$tmp/precommit-gate.sh"
+  waiting="$tmp/precommit.waiting"; verdict="$tmp/precommit.verdict"
+  output="$tmp/sqlite.stdout"; error="$tmp/sqlite.stderr"
+  ( umask 077; : >"$sql"; : >"$output"; : >"$error" ) || {
+    /bin/rm -rf -- "$tmp"; return 13
+  }
+  ( umask 077; printf '%s\n' '#!/bin/bash' \
+      'set -u' \
+      'waiting=${AGMSG_RECEIPT_GATE_WAITING-}' \
+      'verdict=${AGMSG_RECEIPT_GATE_VERDICT-}' \
+      'case "$waiting:$verdict" in /*:/*) ;; *) exit 1 ;; esac' \
+      ': >"$waiting" || exit 1' \
+      'attempt=0' \
+      'while [ ! -f "$verdict" ]; do' \
+      '  attempt=$((attempt + 1)); [ "$attempt" -le 1000 ] || exit 1' \
+      '  sleep 0.01' \
+      'done' >"$gate" ) || { /bin/rm -rf -- "$tmp"; return 13; }
+  /bin/chmod 700 "$gate" 2>/dev/null || { /bin/rm -rf -- "$tmp"; return 13; }
+  verdict_lit="$(_sqlite_lit "$verdict")"
   tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$recipient")"
   cte="$(_sqlite_bounded_unread_cte "$team" "$recipient")"
   selected="$(wc -l <"$rows" | /usr/bin/tr -d ' ')"
@@ -885,16 +904,59 @@ _sqlite_receipt_ack_transaction() {
           AND NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
             AND r.team=e.team AND r.agent='%s' AND r.msg_id=e.id)),%s)))
       WHERE team='%s' AND agent='%s';\n" "$frontier" "$tl" "$al" "$frontier" "$al" "$frontier" "$tl" "$al"
+    # SQLite pauses here with BEGIN IMMEDIATE and every intended write still
+    # uncommitted. The parent shell reruns the same closed claim predicate,
+    # writes one private allow/deny verdict, and only then lets this stream
+    # reach COMMIT. The verdict guard is the only statement between that
+    # external recheck and COMMIT; a deny or missing verdict trips .bail on.
+    printf '.shell /bin/bash "$AGMSG_RECEIPT_GATE_SCRIPT"\n'
+    printf "INSERT INTO _ack_guard VALUES(CASE WHEN CAST(readfile('%s') AS TEXT)='allow' THEN 1 ELSE 0 END);\n" "$verdict_lit"
     printf 'COMMIT;\n'
   } >"$sql" || { /bin/rm -rf -- "$tmp" 2>/dev/null || true; return 13; }
 
-  if result="$(LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" 2>&1)"; then
-    rc=0
+  local AGMSG_RECEIPT_GATE_SCRIPT="$gate"
+  local AGMSG_RECEIPT_GATE_WAITING="$waiting"
+  local AGMSG_RECEIPT_GATE_VERDICT="$verdict"
+  export AGMSG_RECEIPT_GATE_SCRIPT AGMSG_RECEIPT_GATE_WAITING AGMSG_RECEIPT_GATE_VERDICT
+  LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" >"$output" 2>"$error" &
+  sqlite_pid=$!
+  attempt=0
+  while [ ! -f "$waiting" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt 1000 ] || ! kill -0 "$sqlite_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.01
+  done
+
+  if [ -f "$waiting" ]; then
+    if _agmsg_receipt_capability_claim_check "$team"; then
+      claim_rc=0
+      result=allow
+    else
+      claim_rc=$?
+      result=deny
+    fi
+    verdict_tmp="${verdict}.tmp.$$"
+    if ! ( umask 077; printf '%s' "$result" >"$verdict_tmp" ) ||
+       ! /bin/mv -- "$verdict_tmp" "$verdict"; then
+      claim_rc=13
+      /bin/rm -f -- "$verdict_tmp" 2>/dev/null || true
+    fi
   else
-    rc=$?
+    verdict_tmp="${verdict}.tmp.$$"
+    ( umask 077; printf '%s' deny >"$verdict_tmp" ) 2>/dev/null &&
+      /bin/mv -- "$verdict_tmp" "$verdict" 2>/dev/null || true
+  fi
+
+  if wait "$sqlite_pid"; then rc=0; else rc=$?; fi
+  result="$(/bin/cat "$output" "$error" 2>/dev/null)"
+  if [ "$claim_rc" -ne 0 ]; then
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    return 76
   fi
   /bin/rm -rf -- "$tmp" 2>/dev/null || return 13
-  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 0 ] && [ -z "$result" ] && return 0
   case "$result" in
     *'database is locked'*|*'database table is locked'*|*'database schema is locked'*) return 75 ;;
     *) return 13 ;;

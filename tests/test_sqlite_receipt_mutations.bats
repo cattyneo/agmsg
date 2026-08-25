@@ -98,7 +98,8 @@ run_mutant_subset() {
     'no-nonce-uniqueness|Task 4 same-token concurrency commits once' \
     'weak-legacy-identity|Task 4 transaction guards the full event-linked legacy identity' \
     'unbounded-prune|Task 4 retained expiry retries reconcile' \
-    'no-claim-interlock|Task 4 claim markers and a busy writer'
+    'no-claim-interlock|Task 4 claim markers and a busy writer' \
+    'no-precommit-claim-interlock|Task 4 rechecks the repo claim marker after BEGIN immediately before COMMIT'
 }
 
 @test "Task 5 filesystem and lock mutants are killed by narrow named regressions" {
