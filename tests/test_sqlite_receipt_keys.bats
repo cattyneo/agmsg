@@ -400,8 +400,8 @@ start_crashable_init() {
 kill_crashable_init() {
   [ -s "$RECEIPT_CRASH_MARKER" ]
   registered_pid_matches "$RECEIPT_INIT_PID" && kill -9 "$RECEIPT_INIT_PID" 2>/dev/null || true
-  registered_pid_matches "$CRASH_WRAPPER_PID" && kill -9 "$CRASH_WRAPPER_PID" 2>/dev/null || true
   wait_for_test_owned_exit "$RECEIPT_INIT_PID" child
+  registered_pid_matches "$CRASH_WRAPPER_PID" && kill -9 "$CRASH_WRAPPER_PID" 2>/dev/null || true
   wait_for_test_owned_exit "$CRASH_WRAPPER_PID" orphan
   unregister_test_pid "$RECEIPT_INIT_PID"
   unregister_test_pid "$CRASH_WRAPPER_PID"
@@ -413,6 +413,12 @@ assert_crash_marker() {
   [ "$(awk -F= '$1 == "target" { print $2 }' "$RECEIPT_CRASH_MARKER")" = "$expected_target" ]
   [[ "$CRASH_WRAPPER_PID" =~ ^[0-9]+$ ]]
   kill -0 "$CRASH_WRAPPER_PID" 2>/dev/null
+}
+
+assert_crash_lock_owner() {
+  local path="$1" owner
+  owner="$(awk -F= '$1 == "pid" { print $2 }' "$path")"
+  [ "$owner" = "$RECEIPT_INIT_PID" ]
 }
 
 @test "receipt vectors are complete, byte-stable, and distinguish each bound field" {
@@ -1089,6 +1095,31 @@ assert_crash_marker() {
   assert_ready_identity
 }
 
+@test "live two-link initializer stage is busy rather than corrupt during acquisition race" {
+  init_ready
+  local nonce=01112233445566778899aabbccddeeff stage lock
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" "$$" "$nonce"
+  ln "$stage" "$lock"
+  [ "$(file_links "$stage")" -eq 2 ]
+
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ -f "$stage" ]
+  [ -f "$lock" ]
+  [ "$(file_links "$stage")" -eq 2 ]
+}
+
+@test "initializer PID capture records the shell that owns cleanup" {
+  init_ready
+  local probe expected
+  probe="$BATS_TEST_TMPDIR/initializer-parent.pid"
+  _agmsg_receipt_capture_initializer_pid "$(receipt_dir)"
+  /bin/sh -c 'printf "%s\n" "$PPID"' >"$probe"
+  IFS= read -r expected <"$probe"
+  [ "$_AGMSG_RECEIPT_INIT_PID" = "$expected" ]
+}
+
 @test "live init lock is refused and never removed" {
   init_ready
   local nonce=10112233445566778899aabbccddeeff lock
@@ -1171,6 +1202,7 @@ skip_unless_posix_crash_runner() {
   assert_receipt_state_abi
   start_crashable_init post-link-before-unlink
   assert_crash_marker post-link-before-unlink "$(receipt_lock)"
+  assert_crash_lock_owner "$(receipt_lock)"
   kill_crashable_init
   local stage
   stage="$(find "$(receipt_dir)" -maxdepth 1 -name '.init-stage.*' -print -quit)"

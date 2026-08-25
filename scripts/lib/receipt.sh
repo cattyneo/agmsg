@@ -998,6 +998,7 @@ _AGMSG_RECEIPT_INIT_STAGE=
 _AGMSG_RECEIPT_INIT_NONCE=
 _AGMSG_RECEIPT_INIT_IDENTITY=
 _AGMSG_RECEIPT_INIT_PID=
+_AGMSG_RECEIPT_INIT_PID_FILE=
 _AGMSG_RECEIPT_INIT_HELD=0
 _AGMSG_RECEIPT_RECOVERED_EMPTY=0
 
@@ -1070,6 +1071,10 @@ _agmsg_receipt_remove_own_lock() {
 }
 
 _agmsg_receipt_init_cleanup() {
+  if [ -n "${_AGMSG_RECEIPT_INIT_PID_FILE:-}" ]; then
+    /bin/rm -f -- "$_AGMSG_RECEIPT_INIT_PID_FILE" 2>/dev/null || true
+    _AGMSG_RECEIPT_INIT_PID_FILE=
+  fi
   _agmsg_receipt_remove_own_lock
   if [ -n "${_AGMSG_RECEIPT_INIT_STAGE:-}" ] &&
      [ -f "$_AGMSG_RECEIPT_INIT_STAGE" ] &&
@@ -1081,6 +1086,21 @@ _agmsg_receipt_init_cleanup() {
       ;;
     esac
   fi
+}
+
+# Bash 3.2 keeps $$ fixed across subshell functions. A short POSIX child writes
+# its real parent PID to an owner-only file so command substitution cannot add
+# another process between the initializer and the observer.
+_agmsg_receipt_capture_initializer_pid() {
+  local dir="$1" parent
+  _AGMSG_RECEIPT_INIT_PID=
+  _AGMSG_RECEIPT_INIT_PID_FILE="$(umask 077; mktemp "$dir/.init-pid.XXXXXX")" || return 13
+  /bin/sh -c 'printf "%s\n" "$PPID"' >"$_AGMSG_RECEIPT_INIT_PID_FILE" 2>/dev/null || return 13
+  IFS= read -r parent <"$_AGMSG_RECEIPT_INIT_PID_FILE" || return 13
+  /bin/rm -f -- "$_AGMSG_RECEIPT_INIT_PID_FILE" 2>/dev/null || return 13
+  _AGMSG_RECEIPT_INIT_PID_FILE=
+  case "$parent" in ''|*[!0-9]*|0*) return 13 ;; esac
+  _AGMSG_RECEIPT_INIT_PID="$parent"
 }
 
 _agmsg_receipt_lock_state() {
@@ -1113,16 +1133,30 @@ EOF
 }
 
 _agmsg_receipt_reclaim_stages() {
-  local dir="$1" stage record pid nonce _created suffix stat owner mode links _dev _inode
+  local dir="$1" stage lock lock_record record pid nonce _created suffix stat owner mode links _dev _inode
+  lock="$dir/init.lock"
   for stage in "$dir"/.init-stage.*; do
     [ -e "$stage" ] || [ -L "$stage" ] || continue
-    _agmsg_receipt_lock_file_valid "$stage" 1 || return 12
+    _agmsg_receipt_lock_file_valid "$stage" '1:2' || return 12
     record="$(_agmsg_receipt_lock_record "$stage")" || return 12
     IFS=: read -r pid nonce _created <<EOF
 $record
 EOF
     suffix="${stage##*/.init-stage.}"
     [ "$suffix" = "$nonce" ] || return 12
+    stat="$(_agmsg_receipt_stat "$stage")" || return 12
+    IFS=: read -r owner mode links _dev _inode <<EOF
+$stat
+EOF
+    if [ "$links" = 2 ]; then
+      _agmsg_receipt_lock_file_valid "$lock" 2 || return 12
+      _agmsg_receipt_same_inode "$stage" "$lock" || return 12
+      lock_record="$(_agmsg_receipt_lock_record "$lock")" || return 12
+      [ "$lock_record" = "$record" ] || return 12
+      if _agmsg_receipt_pid_is_live_or_unknown "$pid"; then return 13; fi
+      _agmsg_receipt_lock_state "$lock" || return $?
+      continue
+    fi
     if _agmsg_receipt_pid_is_live_or_unknown "$pid"; then return 13; fi
     /bin/rm -f -- "$stage" || return 13
     _AGMSG_RECEIPT_RECOVERED_EMPTY=1
@@ -1286,16 +1320,6 @@ storage_receipt_init() (
     _agmsg_receipt_control_result 13
     exit $?
   fi
-  # Bash 3.2 keeps $$ fixed across subshells. Ask a short-lived child for its
-  # PPID to record the actual process executing this scoped initializer.
-  _AGMSG_RECEIPT_INIT_PID="$(/bin/sh -c 'printf %s "$PPID"')"
-  case "$_AGMSG_RECEIPT_INIT_PID" in
-    ''|*[!0-9]*)
-      _agmsg_receipt_error 'cannot determine receipt initializer process'
-      _agmsg_receipt_control_result 13
-      exit $?
-      ;;
-  esac
   trap _agmsg_receipt_init_cleanup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -1329,6 +1353,12 @@ storage_receipt_init() (
   _agmsg_receipt_validate_dir "$dir" 700 || {
     _agmsg_receipt_error 'receipt directory integrity check failed'
     _agmsg_receipt_control_result 12
+    exit $?
+  }
+
+  _agmsg_receipt_capture_initializer_pid "$dir" || {
+    _agmsg_receipt_error 'cannot determine receipt initializer process'
+    _agmsg_receipt_control_result 13
     exit $?
   }
 

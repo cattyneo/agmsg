@@ -250,6 +250,16 @@ receipt_apply_mutation() {
         '_agmsg_pid_alive_local "$1"' \
         'return 1' || return 1
       ;;
+    no-two-link-init-race)
+      _receipt_mutation_rewrite_nth "$receipt" \
+        '_agmsg_receipt_lock_file_valid "$stage" '\''1:2'\'' || return 12' \
+        '_agmsg_receipt_lock_file_valid "$stage" 1 || return 12' 1 || return 1
+      ;;
+    wrong-init-owner-pid)
+      _receipt_mutation_rewrite "$receipt" \
+        '/bin/sh -c '\''printf "%s\n" "$PPID"'\'' >"$_AGMSG_RECEIPT_INIT_PID_FILE" 2>/dev/null || return 13' \
+        'printf "%s\n" "$(/bin/sh -c '\''printf %s "$PPID"'\'')" >"$_AGMSG_RECEIPT_INIT_PID_FILE" || return 13' || return 1
+      ;;
     unbounded-prune)
       _receipt_mutation_rewrite "$sqlite" \
         "expires_at < CAST(strftime('%%s','now') AS INTEGER)-86400" \

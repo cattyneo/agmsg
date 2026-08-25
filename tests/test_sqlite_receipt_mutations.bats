@@ -38,7 +38,7 @@ run_mutant_regression() {
       ;;
   esac
   case "$id" in
-    no-db-integrity|no-receipt-dir-integrity|no-key-integrity|no-init-lock-integrity|no-dead-owner-check|jsonl-accepts-receipt)
+    no-db-integrity|no-receipt-dir-integrity|no-key-integrity|no-init-lock-integrity|no-dead-owner-check|no-two-link-init-race|wrong-init-owner-pid|jsonl-accepts-receipt)
       test_file="$scratch/tests/test_sqlite_receipt_keys.bats" ;;
     *) test_file="$scratch/tests/test_sqlite_receipt_ack.bats" ;;
   esac
@@ -111,7 +111,9 @@ run_mutant_subset() {
     'no-receipt-dir-integrity|status rejects a receipt directory symlink' \
     'no-key-integrity|status rejects a private key symlink' \
     'no-init-lock-integrity|init rejects an unsafe lock mode' \
-    'no-dead-owner-check|live init lock is refused'
+    'no-dead-owner-check|live init lock is refused' \
+    'no-two-link-init-race|live two-link initializer stage is busy' \
+    'wrong-init-owner-pid|initializer PID capture records the shell'
 }
 
 @test "Task 5 output and retention mutants are killed by narrow named regressions" {
