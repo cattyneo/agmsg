@@ -1446,6 +1446,25 @@ SH
   refute grep -Fq -- private-body "$BATS_TEST_TMPDIR/helper-fault.stderr"
 }
 
+@test "Task 4 post-auth scope helper failure emits one bounded refusal without mutation" {
+  ack_abi_required
+  sql_event scope-helper-fault alice bob private-scope-body-91bc4e72 \
+    2026-01-01T00:00:00Z
+  local token before stderr
+  token="$(issue_list_token bob)"
+  before="$(durable_state)"
+  _agmsg_receipt_scope_hex() { return 71; }
+
+  assert_zero_stdout_failure scope-helper-fault \
+    storage_ack_receipt receipts bob --receipt "$token"
+  stderr="$BATS_TEST_TMPDIR/scope-helper-fault.stderr"
+  [ "$(wc -l <"$stderr" | tr -d ' ')" = 1 ]
+  [ "$(cat "$stderr")" = 'agmsg receipt: acknowledgement failed' ]
+  refute grep -Fq -- "$token" "$stderr"
+  refute grep -Fq -- private-scope-body-91bc4e72 "$stderr"
+  [ "$(durable_state)" = "$before" ]
+}
+
 @test "Task 4 transaction-time expiry is classified after reconciliation" {
   ack_abi_required
   sql_event expiry-barrier alice bob body 2026-01-01T00:00:00Z

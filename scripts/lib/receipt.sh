@@ -833,26 +833,46 @@ _agmsg_receipt_ack() (
     -sigfile "$signature" >/dev/null 2>&1 || {
       _agmsg_receipt_ack_diagnostic signature; exit 13
     }
-  expected_team="$(_agmsg_receipt_scope_hex "$team" "$tmp/team-actual.hex")" || exit 13
-  expected_recipient="$(_agmsg_receipt_scope_hex "$recipient" "$tmp/recipient-actual.hex")" || exit 13
+  expected_team="$(_agmsg_receipt_scope_hex "$team" "$tmp/team-actual.hex")" || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
+  expected_recipient="$(_agmsg_receipt_scope_hex "$recipient" "$tmp/recipient-actual.hex")" || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
   [ "$team_hex" = "$expected_team" ] && [ "$recipient_hex" = "$expected_recipient" ] || {
     _agmsg_receipt_ack_diagnostic scope; exit 13
   }
   actual_generation="$(_agmsg_receipt_sqlite_read "$(_agmsg_receipt_db "$team")" \
-    "SELECT value FROM receipt_meta WHERE key='store_generation';")" || exit 13
-  actual_key="$(_agmsg_receipt_public_fingerprint "$(_agmsg_receipt_public_key "$team")")" || exit 13
+    "SELECT value FROM receipt_meta WHERE key='store_generation';")" || {
+      _agmsg_receipt_ack_diagnostic failed; exit 13
+    }
+  actual_key="$(_agmsg_receipt_public_fingerprint "$(_agmsg_receipt_public_key "$team")")" || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
   [ "$generation" = "$actual_generation" ] && [ "$key_sha" = "$actual_key" ] || {
     _agmsg_receipt_ack_diagnostic identity; exit 13
   }
-  payload_sha="$(_agmsg_receipt_file_sha256 "$payload")" || exit 13
+  payload_sha="$(_agmsg_receipt_file_sha256 "$payload")" || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
   printf '%s\n' "$team_hex" >"$tmp/team.hex"
-  "$AGMSG_RECEIPT_XXD_RESOLVED" -r -p "$tmp/team.hex" >"$tmp/team.bin" 2>/dev/null || exit 13
+  "$AGMSG_RECEIPT_XXD_RESOLVED" -r -p "$tmp/team.hex" >"$tmp/team.bin" 2>/dev/null || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
   printf '%s\n' "$recipient_hex" >"$tmp/recipient.hex"
-  "$AGMSG_RECEIPT_XXD_RESOLVED" -r -p "$tmp/recipient.hex" >"$tmp/recipient.bin" 2>/dev/null || exit 13
-  team_sha="$(_agmsg_receipt_file_sha256 "$tmp/team.bin")" || exit 13
-  recipient_sha="$(_agmsg_receipt_file_sha256 "$tmp/recipient.bin")" || exit 13
+  "$AGMSG_RECEIPT_XXD_RESOLVED" -r -p "$tmp/recipient.hex" >"$tmp/recipient.bin" 2>/dev/null || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
+  team_sha="$(_agmsg_receipt_file_sha256 "$tmp/team.bin")" || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
+  recipient_sha="$(_agmsg_receipt_file_sha256 "$tmp/recipient.bin")" || {
+    _agmsg_receipt_ack_diagnostic failed; exit 13
+  }
 
-  now="$(/bin/date +%s)"; case "$now" in ''|*[!0-9]*) exit 13 ;; esac
+  now="$(/bin/date +%s)"; case "$now" in
+    ''|*[!0-9]*) _agmsg_receipt_ack_diagnostic failed; exit 13 ;;
+  esac
   if [ "$now" -lt "$issued" ]; then
     _agmsg_receipt_reconcile_nonce "$team" "$nonce" "$payload_sha" "$generation" \
       "$team_sha" "$recipient_sha" "$batch_sha" "$frame_sha" "$expires" && {
