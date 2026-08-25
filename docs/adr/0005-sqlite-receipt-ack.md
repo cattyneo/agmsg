@@ -1,6 +1,7 @@
 # ADR 0005: SQLite receipt-bound acknowledgement
 
-**Status:** proposed
+**Status:** accepted (fork-local; downstream activation deferred to
+`cattyneo/.agents#220`)
 **Date:** 2026-08-24
 **Deciders:** cattyneo fork owner (`cattyneo/.agents#211`)
 
@@ -147,13 +148,27 @@ any `message-claim-*` token. Malformed or duplicate capability metadata also
 rejects. The predicate must not use substring scans of unrelated paths,
 functions, tables, or words, and status, issue, and ack use the same predicate.
 
-`storage_ack_receipt` verifies the signed canonical payload, its 15-minute
-time window, current consecutive unread prefix, generation/key/team/recipient,
-both digests, issuance frontier, claim interlock, and nonce inside one SQLite
-`.bail on` / `BEGIN IMMEDIATE` transaction. Only after all checks pass does it
-record the nonce, insert the matching `message_read` events, perform exact
-legacy mirrors, and advance the cursor. It exits 0 with zero stdout only after
-commit; every failure rolls back and emits zero stdout.
+Status and issuance evaluate the same closed claim predicate defined above.
+`storage_ack_receipt` evaluates it once at operation start and again while the
+SQLite `.bail on` / `BEGIN IMMEDIATE` transaction is open, with every intended
+receipt write still uncommitted, immediately before issuing `COMMIT`. The exact
+SQLite `claims` table is also guarded inside that transaction. The
+repo-relative `scripts/lib/claims.sh`, loaded shell functions, and advertised
+capability metadata are outside SQLite's atomic domain.
+
+Claim installation, removal, or update, and any agmsg installation or update
+that can change a claim-predicate authority, MUST NOT run concurrently with
+receipt init, issuance, or acknowledgement. The second check narrows but does
+not eliminate the interval before SQLite commit. This is a documented residual
+TOCTOU, not a hard-atomic claim interlock. Detection at either check fails
+closed with zero stdout and no committed receipt effects.
+
+After the receipt and claim checks pass, nonce consumption, matching
+`message_read` insertion, the exact direct-legacy or event-linked `read_at`
+mirror, cursor advancement, and eligible nonce pruning occur in one SQLite
+durable commit. This one-commit guarantee applies only to receipt effects; it
+does not make external claim authorities atomic with SQLite. Ack exits 0 with
+zero stdout only after commit; every failure rolls back and emits zero stdout.
 
 Each committed nonce row stores the payload digest, store generation,
 team digest, recipient digest, batch digest, frame digest, receipt expiry, and
@@ -262,9 +277,23 @@ runtime dependency, strict filesystem requirements, and explicit unsupported
 platform behavior. JSONL keeps its existing behavior and has no composite
 receipt transaction in this issue.
 
+This fork capability is not a live activation. No `.agents` dependency may be
+installed, updated, or pinned to it until `cattyneo/.agents#220` is completed
+and activation is separately authorized. A future authorized rollout must pin
+a separately verified merge commit rather than a branch name. Rollback stops
+all optional receipt ABI calls and retains key, nonce, and schema evidence; it
+does not delete or silently migrate receipt state.
+
+Every future upstream rebase must rerun the closed-predicate, mutation, and full
+compatibility gates. The fork delta may be removed only after an accepted
+upstream equivalent preserves the bounded-read and one-commit receipt
+contracts, passes equivalent tests, and has an owner-approved migration and
+claim-precedence plan.
+
 ## References
 
 - Issue: `cattyneo/.agents#211`
 - Parent issue: `cattyneo/.agents#116`
+- Activation prerequisite: `cattyneo/.agents#220`
 - Bounded read contract: `docs/spec/driver-interface.md` §2.1.1
 - Storage ABI: `docs/spec/driver-interface.md` §§1.4 and 2.1

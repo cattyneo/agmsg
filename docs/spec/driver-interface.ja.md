@@ -114,7 +114,56 @@ storage_get_message_bounded <team> <agent> <opaque-id> [--max-body-bytes N]
 
 `storage_get_message_bounded` は指定agent宛てで、opaqueな保存済みIDに一致するunread `message_sent` を、body全体が上限内の場合だけ1件返す。recipient scopeを越えず、read markerやcursorを変更しない。後続行を調べてもack候補にはならない。bodyが大きすぎる場合はbodyを含まない `bounded_message_error` metadataだけを出してnon-zeroで終了する。ここでIDはbyte-for-byteのopaque stringであり、transport encoding、shell quoting、新しいID上限は定義しない。
 
-公開CLIのframing、receiptの発行・暗号・expiry・replay・nonce、ackのatomicity、JSONL crash recovery・旧reader移行、`#373`とのprecedenceは別決定であり、このdriver関数には含めない。
+この3関数の通常呼び出しは引き続き読み取り専用である。次節のoptional
+SQLite receipt extensionは、明示的な`--issue-receipt`を指定しない限り
+通常動作を変更しない。JSONL receipt/crash recoveryとupstream `#373`との
+最終precedenceはこのphaseの対象外である。
+
+#### 2.1.2 Optional SQLite receipt acknowledgement（fork order 2b phase 2）
+
+SQLiteは完全一致capability token `sqlite-receipt-ack-v1`をadvertiseし、
+次のoptional ABIを提供できる：
+
+```
+storage_receipt_init <team>
+storage_receipt_status <team>
+storage_ack_receipt <team> <recipient> --receipt <token>
+```
+
+receipt発行はbounded listとexact-showの明示的な`--issue-receipt` optionである。
+選択した全recordが既存の出力検査を通過した後だけ、最後にcompactな
+`bounded_unread_receipt` recordを1件追加する。receiptの有効期間は発行から
+正確に900秒、tokenは最大2,048 bytesで、完成recordには
+`AGMSG_BOUNDED_MAX_RECORD_BYTES`（既定8,192、設定可能な最大65,536）も
+適用する。上限超過その他の失敗はnon-zero、stdout 0 bytes、永続変更なし、
+boundedかつ非機密のstderrとなる。canonical byte契約とfixed vectorは
+[ADR 0005](../adr/0005-sqlite-receipt-ack.md)を規範とする。
+
+JSONLはこのoptional ABIをadvertiseも実装もせず、`--issue-receipt`を
+non-zero、stdout 0 bytes、永続変更なしで拒否する。Git Bash/Windowsも
+receipt init・issue・ackは非対応である。既存のlegacy経路とbounded
+read-only経路は引き続き利用できる。
+
+ackは同じclosed claim predicateを操作開始時と、`BEGIN IMMEDIATE`を開いて
+全receipt効果が未commitの状態で`COMMIT`する直前に再検査する。predicate
+authorityを変更するclaimのinstall・remove・update、またはagmsgの
+install/updateを、receipt init・issue・ackと並行して実行してはならない。
+SQLiteの`claims` tableはtransaction内でguardするが、repository file、
+loaded shell function、capability metadataはSQLiteのatomic domain外にある。
+2回目の検査からcommitまでには残存TOCTOUがあり、hard-atomic claim
+interlockと表現してはならない。
+
+nonce消費、対応する`message_read` event、exact legacy `read_at` mirror、
+cursor前進、対象nonce pruneは1つのSQLite durable commitで行う。この保証は
+外部claim保守へは及ばない。retention中の全field nonce evidenceが一致する
+exact retryは`already_committed`となり、prune済みまたは不一致のreplayは
+拒否する。diagnosticにreceipt token、key bytes、private body、private
+filesystem pathを含めてはならない。
+
+このextensionはopaque IDのtransport grammarもID固有最大長も定義せず、
+JSONL receipt pathやlive `.agents` callerを追加しない。downstreamのinstall、
+update、dependency pin、runtime activationには、先に`cattyneo/.agents#220`の
+完了が必要である。
 
 ### 2.2 イベントログスキーマ
 
@@ -136,7 +185,10 @@ storage_get_message_bounded <team> <agent> <opaque-id> [--max-body-bytes N]
 1. イベントログのリファクタリング以前のインストールのための、レガシーな `messages` テーブル（`read=0` の行）
 2. リファクタリング後に書き込まれたすべてのデータのための、新しいイベントログテーブル
 
-書き込みはイベントログのみを対象とする。自動的なマイグレーションは存在せず、レガシーな行はそのまま残り、無期限にクエリ可能であり続ける。
+通常の書き込みはイベントログを対象とする。§2.1.2のoptional receipt ackだけは
+例外として、exact direct legacy rowまたは`events.legacy_id`で結ばれたexact rowの
+`read_at`をmirrorする。その他の新しいread progressはlegacy `read_at`を変更しない。
+自動的なマイグレーションは存在せず、レガシーな行はそのまま残り、無期限にクエリ可能であり続ける。
 
 ### 2.4 識別子
 

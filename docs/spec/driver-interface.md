@@ -209,9 +209,58 @@ candidate. An oversized match emits only `bounded_message_error` metadata and
 exits non-zero. IDs remain byte-for-byte opaque strings here: this operation
 does not define transport encoding, shell quoting, or a new ID maximum.
 
-Public CLI framing, receipt issuance/crypto/expiry/replay/nonce, ack atomicity,
-JSONL crash recovery or old-reader migration, and precedence with `#373` remain
-separate decisions and are not part of these driver functions.
+Normal calls to these three functions remain read-only. The optional SQLite
+receipt extension below does not change their behavior unless its explicit
+`--issue-receipt` flag is supplied. JSONL receipt/crash recovery and final
+precedence with upstream `#373` remain outside this phase.
+
+#### 2.1.2 Optional SQLite receipt acknowledgement (fork order 2b phase 2)
+
+SQLite may advertise the exact whole-token capability
+`sqlite-receipt-ack-v1` and expose:
+
+```
+storage_receipt_init <team>
+storage_receipt_status <team>
+storage_ack_receipt <team> <recipient> --receipt <token>
+```
+
+Receipt issuance is the explicit `--issue-receipt` option on bounded list and
+exact-show. It appends one final compact `bounded_unread_receipt` record only
+after every selected record has passed the existing output checks. Receipts
+expire exactly 900 seconds after issuance, tokens are at most 2,048 bytes, and
+the final record is also subject to `AGMSG_BOUNDED_MAX_RECORD_BYTES` (default
+8,192; configured maximum 65,536). Oversize or any other failure is non-zero
+with zero stdout, no durable change, and bounded non-sensitive stderr. The
+canonical byte contract and fixed vectors are normative in
+[ADR 0005](../adr/0005-sqlite-receipt-ack.md).
+
+JSONL neither advertises nor implements this optional ABI and rejects
+`--issue-receipt` non-zero with zero stdout and no mutation. Git Bash/Windows
+is likewise unsupported for receipt init, issue, and ack. Existing legacy and
+bounded read-only paths remain supported.
+
+Acknowledgement evaluates the same closed claim predicate at operation start
+and again with `BEGIN IMMEDIATE` open and every receipt effect uncommitted,
+immediately before `COMMIT`. Claim installation, removal, update, or any agmsg
+install/update that changes a predicate authority MUST NOT run concurrently
+with receipt init, issue, or acknowledgement. The SQLite `claims` table is
+guarded transactionally, but repository files, loaded shell functions, and
+capability metadata are outside SQLite's atomic domain. The remaining
+pre-commit interval is a residual TOCTOU and MUST NOT be described as a
+hard-atomic claim interlock.
+
+Nonce consumption, matching `message_read` events, exact legacy `read_at`
+mirrors, cursor advancement, and eligible nonce pruning form one SQLite durable
+commit. This guarantee does not extend to external claim maintenance. Exact
+retries report `already_committed` while the retained all-field nonce evidence
+matches; pruned or mismatched replay is refused. Diagnostics never contain a
+receipt token, key bytes, private body, or private filesystem path.
+
+This extension defines neither an opaque-ID transport grammar nor an
+ID-specific maximum, adds no JSONL receipt path, and activates no live
+`.agents` caller. `cattyneo/.agents#220` must complete before any downstream
+install, update, dependency pin, or runtime activation.
 
 ### 2.2 Delivery cursor (watch / replay)
 
@@ -281,7 +330,10 @@ frontier or an exact `message_read` exception. Read-marking is
 **recipient-scoped**: a `message_read` names the `(team, agent)` that read the
 message, so marking one recipient's copy never affects another's, and re-marking
 an already-read id is **idempotent**. The legacy mutable `messages.read_at`
-field is compatibility/audit input only; new read progress never mutates it.
+field is compatibility/audit input for ordinary read progress. Optional receipt
+acknowledgement is the sole exception: it mirrors only the exact direct legacy
+row or the exact row linked by `events.legacy_id`; all other new read progress
+leaves the field unchanged.
 
 **Schema version.** This is **event-log schema v1**. The two event types above
 and their fields are the v1 contract. Forward compatibility is a hard rule, not a
@@ -303,9 +355,10 @@ The bundled sqlite driver reads two sources for `storage_list_unread` and
    predate the event log, and
 2. the event-log tables for everything written after.
 
-Writes target the event log. There is no automated migration; legacy rows stay
-queryable indefinitely. Legacy integer ids are passed through as decimal strings
-(opaque, per §2.5).
+Writes target the event log except for the exact `read_at` mirror performed by
+optional receipt acknowledgement as defined in §2.1.2. There is no automated
+migration; legacy rows stay queryable indefinitely. Legacy integer ids are
+passed through as decimal strings (opaque, per §2.5).
 
 **Known gap — consumers still coupled to the sqlite driver's own schema.**
 `rename.sh`/`rename-team.sh` (rewriting a renamed identity across historical

@@ -9,9 +9,12 @@
 mark only the exact consecutive unread prefix which a bounded read completed,
 with nonce consumption and every read-state transition in one durable commit.
 
-**Source of truth:** `cattyneo/.agents#211`, especially the direct owner decision
-recorded on 2026-08-24. Parent context is `cattyneo/.agents#116`; bounded reads
-were established by `cattyneo/.agents#203` and fork PR `cattyneo/agmsg#2`.
+**Source of truth:** `cattyneo/.agents#211`, especially the direct owner
+decisions recorded on 2026-08-24 and 2026-08-25. Parent context is
+`cattyneo/.agents#116`; bounded reads were established by
+`cattyneo/.agents#203` and fork PR `cattyneo/agmsg#2`. Shared maintenance-lock
+follow-up `cattyneo/.agents#220` is mandatory before downstream activation, but
+does not block this fork-local PR or merge.
 
 **Observable success criteria:**
 
@@ -35,8 +38,10 @@ were established by `cattyneo/.agents#203` and fork PR `cattyneo/agmsg#2`.
   and displayed-metadata mutation cases without changing the opaque ID
   transport contract.
 - `storage_ack_receipt <team> <recipient> --receipt <token>` returns exit 0 and
-  stdout 0 bytes only after commit. In one `.bail on` / `BEGIN IMMEDIATE`
-  transaction it rechecks the valid time window, claim interlock, unused nonce,
+  stdout 0 bytes only after commit. It evaluates the same closed claim
+  predicate at operation start and again with one `.bail on` /
+  `BEGIN IMMEDIATE` transaction open, immediately before `COMMIT`; within that
+  transaction it also rechecks the valid time window, SQLite claim interlock, unused nonce,
   exact current consecutive prefix, both digests, and issuance frontier; then
   records the nonce, inserts `message_read` events, mirrors only the matching
   legacy rows, and advances the cursor without crossing a gap or the issuance
@@ -54,6 +59,12 @@ were established by `cattyneo/.agents#203` and fork PR `cattyneo/agmsg#2`.
   an unknown `message-claim-*` version also reject; unrelated uses of the word
   "lease" do not. A future rebase that changes these authority sources
   invalidates the acceptance and requires a new owner decision.
+- External claim/install/update maintenance MUST NOT run concurrently with
+  receipt init, issue, or ack. Repository files, loaded functions, and
+  capability metadata are outside SQLite's atomic domain, so the final
+  pre-commit recheck narrows but does not eliminate a residual TOCTOU. This
+  plan does not claim hard cross-domain atomicity; `cattyneo/.agents#220` must
+  add the shared maintenance lock before any downstream pin or activation.
 - Focused RED/GREEN and controlled mutation evidence covers every owner-listed
   historical failure class, Bash 3.2, Linux/macOS, Git Bash fail-closed behavior,
   WAL and DELETE journal modes, existing official gates, and independent exact
@@ -412,7 +423,8 @@ OpenSSL 3, `xxd`, and the existing storage facade.
 - Modify `docs/spec/driver-interface.md` and
   `docs/spec/driver-interface.ja.md` with normative parity.
 - Update `README.md` only for the optional fork capability and maintenance
-  lifecycle; do not advertise downstream activation.
+  lifecycle, and make the same boundary explicit in `README.ja.md`; do not
+  advertise downstream activation.
 
 **Steps:**
 

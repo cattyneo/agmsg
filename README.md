@@ -541,6 +541,30 @@ bats tests/    # requires bats-core: brew install bats-core
 - **No daemon**: Direct filesystem access
 - **No network**: Everything local
 
+### Fork-only optional SQLite receipt capability
+
+The bundled SQLite driver contains an opt-in receipt-bound acknowledgement
+ABI. Current inbox, watcher, hook, delivery, and JSONL paths do not call it.
+Receipt init, issue, and ack additionally require OpenSSL 3 and `xxd`, and are
+unsupported on Git Bash/Windows; the ordinary paths described above retain
+their existing platform support.
+
+The closed claim predicate is checked at operation start and again with the
+receipt transaction open immediately before commit. External claim authorities
+are not atomic with SQLite: claim/install/update maintenance must not run
+concurrently with receipt operations, and a residual TOCTOU remains. This is
+not a hard-atomic claim interlock.
+
+Merging this fork capability does not authorize installation, dependency
+pinning, or live activation. `cattyneo/.agents#220` must complete first. A
+later separately authorized rollout must pin a verified merge commit; rollback
+stops optional receipt calls while retaining key, nonce, and schema evidence.
+The fork delta may be removed only after an equivalent upstream contract,
+equivalent tests, and an owner-approved migration and claim-precedence plan
+exist. Wire details are defined in
+[ADR 0005](docs/adr/0005-sqlite-receipt-ack.md) and the
+[driver interface](docs/spec/driver-interface.md#212-optional-sqlite-receipt-acknowledgement-fork-order-2b-phase-2).
+
 ## Plugins
 
 agmsg's pluggable units are **drivers** grouped by axis (`types` for agent
