@@ -177,7 +177,7 @@ receipt_apply_mutation() {
       ;;
     ignore-commit-result)
       _receipt_mutation_rewrite "$sqlite" \
-        '[ "$rc" -eq 0 ] && return 0' \
+        '[ "$rc" -eq 0 ] && [ -z "$result" ] && return 0' \
         'return 0' || return 1
       ;;
     no-prefix-reconstruction)
