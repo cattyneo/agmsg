@@ -1183,6 +1183,29 @@ assert_crash_lock_owner() {
   [ ! -e "$lock" ]
 }
 
+@test "completed recovery before fixed-lock record read is transient" {
+  init_ready
+  local nonce=05112233445566778899aabbccddeeff stage lock expected_lock_record
+  stage="$(receipt_stage "$nonce")"; lock="$(receipt_lock)"
+  write_lock_record "$stage" 99999999 "$nonce"
+  ln "$stage" "$lock"
+  expected_lock_record="99999999:$nonce:$(awk -F= '$1 == "created_at" { print $2 }' "$stage")"
+  _agmsg_receipt_lock_record() {
+    if [ "$1" = "$stage" ]; then
+      printf '%s\n' "$expected_lock_record"
+      return 0
+    fi
+    /bin/rm -f -- "$stage" "$lock"
+    return 1
+  }
+  _agmsg_receipt_pid_is_live_or_unknown() { return 1; }
+
+  run _agmsg_receipt_reclaim_stages "$(receipt_dir)"
+  [ "$status" -eq 13 ]
+  [ ! -e "$stage" ]
+  [ ! -e "$lock" ]
+}
+
 @test "initializer PID capture records the shell that owns cleanup" {
   init_ready
   local probe expected

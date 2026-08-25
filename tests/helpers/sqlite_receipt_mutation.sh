@@ -260,6 +260,11 @@ receipt_apply_mutation() {
         '_agmsg_receipt_reclaim_advanced_state "$stage" "$lock" "$record" "$pid"' \
         'return 12 #' 1 || return 1
       ;;
+    no-lock-record-transition-retry)
+      _receipt_mutation_rewrite_nth "$receipt" \
+        '_agmsg_receipt_reclaim_advanced_state "$stage" "$lock" "$record" "$pid"' \
+        'return 12 #' 2 || return 1
+      ;;
     no-direct-init-transition-retry)
       _receipt_mutation_rewrite_nth "$receipt" \
         '_agmsg_receipt_reclaim_advanced_state "$stage" "$lock" "$record" "$pid"' \
