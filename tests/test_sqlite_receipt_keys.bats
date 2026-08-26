@@ -1381,6 +1381,60 @@ assert_crash_lock_owner() {
   [ -f "$lock" ]
 }
 
+@test "initializer lock refusal fails closed when its clock is malformed" {
+  init_ready
+  local nonce=32112233445566778899aabbccddeeff lock status_code
+  lock="$(receipt_lock)"
+  write_lock_record "$lock" "$$" "$nonce"
+  _agmsg_receipt_now() { printf '%s\n' malformed; }
+
+  if _agmsg_receipt_acquire_init_lock receipts \
+      >"$BATS_TEST_TMPDIR/receipt-malformed-clock.stdout" \
+      2>"$BATS_TEST_TMPDIR/receipt-malformed-clock.stderr"; then
+    status_code=0
+  else
+    status_code=$?
+  fi
+
+  [ "$status_code" -eq 13 ]
+  [ ! -s "$BATS_TEST_TMPDIR/receipt-malformed-clock.stdout" ]
+  grep -F 'cannot determine receipt init lock deadline' \
+    "$BATS_TEST_TMPDIR/receipt-malformed-clock.stderr"
+  [ -f "$lock" ]
+}
+
+@test "initializer lock refusal fails closed when its clock moves backwards" {
+  init_ready
+  local nonce=33112233445566778899aabbccddeeff lock clock_file status_code
+  lock="$(receipt_lock)"
+  write_lock_record "$lock" "$$" "$nonce"
+  clock_file="$BATS_TEST_TMPDIR/receipt-backwards-clock"
+  : >"$clock_file"
+  export AGMSG_TEST_RECEIPT_CLOCK="$clock_file"
+  _agmsg_receipt_now() {
+    if [ -s "$AGMSG_TEST_RECEIPT_CLOCK" ]; then
+      printf '%s\n' 999
+    else
+      printf '%s\n' 1000
+      printf '%s\n' seen >"$AGMSG_TEST_RECEIPT_CLOCK"
+    fi
+  }
+
+  if _agmsg_receipt_acquire_init_lock receipts \
+      >"$BATS_TEST_TMPDIR/receipt-backwards-clock.stdout" \
+      2>"$BATS_TEST_TMPDIR/receipt-backwards-clock.stderr"; then
+    status_code=0
+  else
+    status_code=$?
+  fi
+
+  [ "$status_code" -eq 13 ]
+  [ ! -s "$BATS_TEST_TMPDIR/receipt-backwards-clock.stdout" ]
+  grep -F 'receipt init lock clock moved backwards' \
+    "$BATS_TEST_TMPDIR/receipt-backwards-clock.stderr"
+  [ -f "$lock" ]
+}
+
 # These require a POSIX runner with executable command-shadowing semantics;
 # native Git Bash has its own unsupported receipt boundary and is covered below.
 skip_unless_posix_crash_runner() {
