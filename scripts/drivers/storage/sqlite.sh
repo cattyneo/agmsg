@@ -60,6 +60,12 @@ _sqlite_data_stdin() {
   ( set -o pipefail; printf '%s\n' "$2" | agmsg_sqlite -batch "$(_sqlite_db "$1")" | tr -d '\r' )
 }
 
+# The receipt state ABI is SQLite-only and opt-in. Sourcing these definitions
+# does not run a runtime probe, create state, advertise the complete capability,
+# or alter any legacy/bounded read path.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/lib/receipt.sh"
+
 # IN (...) list of "team:agent" pairs.
 _sqlite_pair_in() {
   local out="" p t a
@@ -87,7 +93,7 @@ storage_describe() {
   # store was asked about. This is not a second way to reach the store.
   printf 'name=sqlite\n'
   printf 'backend=SQLite (WAL) event log + legacy messages table\n'
-  printf 'capabilities=stage1-sync,stage1-resync,stage2-read-state\n'
+  printf 'capabilities=stage1-sync,stage1-resync,stage2-read-state,sqlite-receipt-ack-v1\n'
   [ -z "${1-}" ] || printf 'db=%s\n' "$(_sqlite_db "$1")"
 }
 
@@ -633,6 +639,460 @@ ORDER BY phase,ord;
 SQL
 }
 
+# Receipt issuance uses a separate, opt-in statement so ordinary phase-1 reads
+# remain byte-for-byte untouched and never probe receipt state. One SELECT
+# snapshot emits both public records and private hex-only canonicalization rows.
+_sqlite_receipt_list_sql() {
+  local team="$1" agent="$2" limit="$3" max_bytes="$4" max_record="$5" cte
+  cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  cat <<SQL
+$cte,
+ordered AS (
+  SELECT u.*, length(CAST(u.body AS BLOB)) AS body_bytes,
+         row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n,
+         sum(length(CAST(u.body AS BLOB))) OVER
+           (ORDER BY u.ts,u.src,u.ord ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           AS cumulative_bytes,
+         length(CAST(json_object('type','message_sent','id',u.id,'team',u.team,
+           'from',u.from_agent,'to',u.to_agent,'body',u.body,'at',u.at) AS BLOB))
+           AS record_bytes
+    FROM unread u
+),
+checks AS (
+  SELECT COUNT(*) AS total_count,
+         COALESCE(SUM(body_bytes),0) AS total_body_bytes,
+         COALESCE(SUM(CASE WHEN typeof(id)!='text' OR typeof(team)!='text'
+                              OR typeof(from_agent)!='text' OR typeof(to_agent)!='text'
+                              OR typeof(body)!='text' OR typeof(at)!='text'
+                           THEN 1 ELSE 0 END),0) AS bad_count,
+         COUNT(*)-COUNT(DISTINCT id) AS duplicate_count,
+         COALESCE(SUM(CASE WHEN record_bytes>$max_record THEN 1 ELSE 0 END),0) AS oversize_count,
+         COALESCE(MAX(CASE WHEN n=1 THEN body_bytes END),0) AS first_body_bytes
+    FROM ordered
+),
+state AS (
+  SELECT CASE WHEN bad_count>0 OR duplicate_count>0 OR oversize_count>0 THEN 'invalid'
+              WHEN $limit>0 AND total_count>0 AND first_body_bytes>$max_bytes THEN 'overflow'
+              ELSE 'ok' END AS status,total_count,total_body_bytes
+    FROM checks
+),
+selected AS (
+  SELECT * FROM ordered,state
+   WHERE state.status='ok' AND n<=$limit AND cumulative_bytes<=$max_bytes
+),
+selection AS (
+  SELECT COUNT(*) AS selected_count,COALESCE(SUM(body_bytes),0) AS selected_body_bytes
+    FROM selected
+),
+identity AS (
+  SELECT (SELECT value FROM receipt_meta WHERE key='store_generation') AS generation,
+         (SELECT value FROM receipt_meta WHERE key='public_key_sha256') AS key_sha256,
+         COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0) AS frontier
+)
+SELECT line FROM (
+  SELECT 0 AS phase,0 AS ord,
+         json_object('type','__agmsg_bounded_status','status',status) AS line FROM state
+  UNION ALL
+  SELECT 1,n,json_object('type','message_sent','id',id,'team',team,
+         'from',from_agent,'to',to_agent,'body',body,'at',at) FROM selected
+  UNION ALL
+  SELECT 2,0,json_object('type','bounded_unread_result',
+         'selected_count',selection.selected_count,
+         'selected_body_bytes',selection.selected_body_bytes,
+         'remaining_count',state.total_count-selection.selected_count,
+         'remaining_body_bytes',state.total_body_bytes-selection.selected_body_bytes,
+         'limit_items',$limit,'max_body_bytes',$max_bytes)
+    FROM state,selection WHERE state.status='ok'
+  UNION ALL
+  SELECT 3,0,'__agmsg_receipt_meta|' || identity.generation || '|' ||
+         identity.key_sha256 || '|' || identity.frontier || '|' || selection.selected_count
+    FROM state,selection,identity
+   WHERE state.status='ok' AND selection.selected_count>0
+  UNION ALL
+  SELECT 4,n,'__agmsg_receipt_row|' || (n-1) || '|' || lower(hex(CAST(team AS BLOB))) ||
+         '|' || lower(hex(CAST(from_agent AS BLOB))) || '|' || lower(hex(CAST(to_agent AS BLOB))) ||
+         '|' || lower(hex(CAST(at AS BLOB))) || '|' || CASE src WHEN 1 THEN 'event' ELSE 'legacy' END ||
+         '|' || ord || '|' || lower(hex(CAST(id AS BLOB))) || '|' || lower(hex(CAST(body AS BLOB)))
+    FROM selected
+)
+ORDER BY phase,ord;
+SQL
+}
+
+_sqlite_receipt_show_sql() {
+  local team="$1" agent="$2" message_id="$3" max_bytes="$4" max_record="$5"
+  local cte id_lit
+  cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  id_lit="$(_sqlite_lit "$message_id")"
+  cat <<SQL
+$cte,
+ordered AS (
+  SELECT u.*,length(CAST(u.body AS BLOB)) AS body_bytes,
+         row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n,
+         length(CAST(json_object('type','message_sent','id',u.id,'team',u.team,
+           'from',u.from_agent,'to',u.to_agent,'body',u.body,'at',u.at) AS BLOB)) AS record_bytes
+    FROM unread u
+),
+checks AS (
+  SELECT (SELECT COUNT(*) FROM ordered WHERE id='$id_lit') AS target_count,
+         COALESCE((SELECT SUM(CASE WHEN typeof(id)!='text' OR typeof(team)!='text'
+                              OR typeof(from_agent)!='text' OR typeof(to_agent)!='text'
+                              OR typeof(body)!='text' OR typeof(at)!='text'
+                           THEN 1 ELSE 0 END) FROM ordered),0) AS bad_count,
+         (SELECT COUNT(*) FROM ordered)-(SELECT COUNT(DISTINCT id) FROM ordered) AS duplicate_count
+),
+state AS (
+  SELECT CASE WHEN bad_count>0 OR duplicate_count>0 THEN 'invalid'
+              WHEN target_count!=1 THEN 'not_found'
+              WHEN (SELECT n FROM ordered WHERE id='$id_lit')!=1 THEN 'not_prefix'
+              WHEN (SELECT body_bytes FROM ordered WHERE id='$id_lit')>$max_bytes THEN 'overflow'
+              WHEN (SELECT record_bytes FROM ordered WHERE id='$id_lit')>$max_record THEN 'invalid'
+              ELSE 'ok' END AS status FROM checks
+),
+selected AS (SELECT * FROM ordered,state WHERE id='$id_lit' AND state.status='ok'),
+identity AS (
+  SELECT (SELECT value FROM receipt_meta WHERE key='store_generation') AS generation,
+         (SELECT value FROM receipt_meta WHERE key='public_key_sha256') AS key_sha256,
+         COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0) AS frontier
+)
+SELECT line FROM (
+  SELECT 0 AS phase,0 AS ord,
+         json_object('type','__agmsg_bounded_status','status',status) AS line FROM state
+  UNION ALL
+  SELECT 1,n,json_object('type','message_sent','id',id,'team',team,
+         'from',from_agent,'to',to_agent,'body',body,'at',at) FROM selected
+  UNION ALL
+  SELECT 2,0,'__agmsg_receipt_meta|' || identity.generation || '|' ||
+         identity.key_sha256 || '|' || identity.frontier || '|1'
+    FROM state,identity WHERE state.status='ok'
+  UNION ALL
+  SELECT 3,n,'__agmsg_receipt_row|0|' || lower(hex(CAST(team AS BLOB))) ||
+         '|' || lower(hex(CAST(from_agent AS BLOB))) || '|' || lower(hex(CAST(to_agent AS BLOB))) ||
+         '|' || lower(hex(CAST(at AS BLOB))) || '|' || CASE src WHEN 1 THEN 'event' ELSE 'legacy' END ||
+         '|' || ord || '|' || lower(hex(CAST(id AS BLOB))) || '|' || lower(hex(CAST(body AS BLOB)))
+    FROM selected
+)
+ORDER BY phase,ord;
+SQL
+}
+
+# Private acknowledgement snapshot. It emits only canonical hex rows and is
+# captured in an owner-only temporary directory by receipt.sh; no public record
+# is emitted and the query travels over stdin rather than argv.
+_sqlite_receipt_ack_snapshot_sql() {
+  local team="$1" agent="$2" selected="$3" cte
+  cte="$(_sqlite_bounded_unread_cte "$team" "$agent")"
+  cat <<SQL
+$cte,
+ordered AS (
+  SELECT u.*,row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n
+    FROM unread u
+)
+SELECT '__agmsg_receipt_row|' || (n-1) || '|' || lower(hex(CAST(team AS BLOB))) ||
+       '|' || lower(hex(CAST(from_agent AS BLOB))) || '|' || lower(hex(CAST(to_agent AS BLOB))) ||
+       '|' || lower(hex(CAST(at AS BLOB))) || '|' || CASE src WHEN 1 THEN 'event' ELSE 'legacy' END ||
+       '|' || ord || '|' || lower(hex(CAST(id AS BLOB))) || '|' || lower(hex(CAST(body AS BLOB)))
+  FROM ordered WHERE n<=$selected ORDER BY n;
+SQL
+}
+
+# Publish the private pre-COMMIT verdict through a create-then-rename pair.
+# Keeping this operation behind a shell function gives the transaction owner a
+# single failure boundary: a missing verdict must never be interpreted as an
+# allow, and callers can inject either filesystem half of the pair without
+# exposing receipt rows or token material.
+_sqlite_receipt_publish_verdict() {
+  local verdict="$1" result="$2" verdict_tmp="$3"
+  if ! ( umask 077; printf '%s' "$result" >"$verdict_tmp" ) 2>/dev/null ||
+     ! /bin/mv -- "$verdict_tmp" "$verdict" 2>/dev/null; then
+    /bin/rm -f -- "$verdict_tmp" 2>/dev/null || true
+    return 13
+  fi
+}
+
+# Bash 3.2 keeps $$ fixed across subshell functions, so it cannot identify the
+# receipt transaction owner. A short POSIX child observes its real parent PID;
+# the file avoids command substitution, which would add another subshell and
+# capture the wrong process. The caller's owner-only temp directory contains
+# the file, and the value is removed immediately after validation.
+_sqlite_receipt_capture_parent_pid() {
+  local destination="$1" parent
+  _AGMSG_RECEIPT_GATE_PARENT_PID=
+  /bin/sh -c 'printf "%s\n" "$PPID"' >"$destination" 2>/dev/null || return 13
+  IFS= read -r parent <"$destination" || {
+    /bin/rm -f -- "$destination" 2>/dev/null || true
+    return 13
+  }
+  /bin/rm -f -- "$destination" 2>/dev/null || return 13
+  case "$parent" in ''|*[!0-9]*|0*) return 13 ;; esac
+  _AGMSG_RECEIPT_GATE_PARENT_PID="$parent"
+}
+
+# Run the complete ack mutation in one sqlite3 invocation and one IMMEDIATE
+# transaction. Expected raw bytes are imported into a TEMP table through SQL
+# stdin; opaque IDs and bodies never enter argv or diagnostics.
+_sqlite_receipt_ack_transaction() {
+  local team="$1" recipient="$2" rows="$3" nonce="$4" payload_sha="$5"
+  local generation="$6" key_sha="$7" team_sha="$8" recipient_sha="$9"
+  shift 9
+  local batch_sha="$1" frame_sha="$2" frontier="$3" issued="$4" expires="$5"
+  local db tmp sql gate waiting verdict output error verdict_lit verdict_tmp parent_file
+  local index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra
+  local cte tl al result rc=0 selected sqlite_pid attempt claim_rc=0 verdict_rc=0
+  db="$(_sqlite_db "$team")" || return 13
+  tmp="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agmsg-receipt-sql.XXXXXX" 2>/dev/null)" || return 13
+  /bin/chmod 700 "$tmp" 2>/dev/null || { /bin/rm -rf -- "$tmp"; return 13; }
+  parent_file="$tmp/parent.pid"
+  _sqlite_receipt_capture_parent_pid "$parent_file" || {
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    return 13
+  }
+  sql="$tmp/ack.sql"; gate="$tmp/precommit-gate.sh"
+  waiting="$tmp/precommit.waiting"; verdict="$tmp/precommit.verdict"
+  output="$tmp/sqlite.stdout"; error="$tmp/sqlite.stderr"
+  ( umask 077; : >"$sql"; : >"$output"; : >"$error" ) || {
+    /bin/rm -rf -- "$tmp"; return 13
+  }
+  ( umask 077; printf '%s\n' '#!/bin/bash' \
+      'set -u' \
+      'waiting=${AGMSG_RECEIPT_GATE_WAITING-}' \
+      'verdict=${AGMSG_RECEIPT_GATE_VERDICT-}' \
+      'parent=${AGMSG_RECEIPT_GATE_PARENT_PID-}' \
+      'instance_id_lib=${AGMSG_RECEIPT_INSTANCE_ID_LIB-}' \
+      'case "$waiting:$verdict" in /*:/*) ;; *) exit 1 ;; esac' \
+      'case "$instance_id_lib" in /*) ;; *) exit 1 ;; esac' \
+      'case "$parent" in ""|*[!0-9]*|0*) exit 1 ;; esac' \
+      '. "$instance_id_lib" || exit 1' \
+      ': >"$waiting" || exit 1' \
+      'attempt=0' \
+      'while [ ! -f "$verdict" ]; do' \
+      '  _agmsg_pid_alive_local "$parent" || exit 1' \
+      '  attempt=$((attempt + 1)); [ "$attempt" -le 1000 ] || exit 1' \
+      '  sleep 0.01' \
+      'done' >"$gate" ) || { /bin/rm -rf -- "$tmp"; return 13; }
+  /bin/chmod 700 "$gate" 2>/dev/null || { /bin/rm -rf -- "$tmp"; return 13; }
+  verdict_lit="$(_sqlite_lit "$verdict")"
+  tl="$(_sqlite_lit "$team")"; al="$(_sqlite_lit "$recipient")"
+  cte="$(_sqlite_bounded_unread_cte "$team" "$recipient")"
+  selected="$(wc -l <"$rows" | /usr/bin/tr -d ' ')"
+  {
+    printf '.bail on\n.timeout 1000\n'
+    printf 'CREATE TEMP TABLE _ack_expected(idx INTEGER PRIMARY KEY,team_hex TEXT,from_hex TEXT,to_hex TEXT,at_hex TEXT,source TEXT,source_ord INTEGER,id_hex TEXT,body_hex TEXT,id_value TEXT,body_value TEXT);\n'
+    while IFS='|' read -r index team_hex from_hex to_hex at_hex source source_ord id_hex body_hex extra; do
+      [ -z "$extra" ] || return 13
+      printf "INSERT INTO _ack_expected VALUES(%s,'%s','%s','%s','%s','%s',%s,'%s','%s',CAST(X'%s' AS TEXT),CAST(X'%s' AS TEXT));\n" \
+        "$index" "$team_hex" "$from_hex" "$to_hex" "$at_hex" "$source" \
+        "$source_ord" "$id_hex" "$body_hex" "$id_hex" "$body_hex"
+    done <"$rows"
+    printf 'CREATE TEMP TABLE _ack_guard(value INTEGER CHECK(value=1));\n'
+    printf 'BEGIN IMMEDIATE;\n'
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims') THEN 1 ELSE 0 END));\n"
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN (SELECT value FROM receipt_meta WHERE key='store_generation')='%s' AND (SELECT value FROM receipt_meta WHERE key='public_key_sha256')='%s' THEN 1 ELSE 0 END));\n" "$generation" "$key_sha"
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN %s<=CAST(strftime('%%s','now') AS INTEGER) AND CAST(strftime('%%s','now') AS INTEGER)<%s THEN 1 ELSE 0 END));\n" "$issued" "$expires"
+    printf "INSERT INTO _ack_guard VALUES((SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM receipt_nonces WHERE nonce='%s') THEN 1 ELSE 0 END));\n" "$nonce"
+    printf '%s, ordered AS (SELECT u.*,row_number() OVER (ORDER BY u.ts,u.src,u.ord) AS n FROM unread u)\n' "$cte"
+    printf "INSERT INTO _ack_guard SELECT CASE WHEN
+      (SELECT COUNT(*) FROM _ack_expected)=%s
+      AND (SELECT COUNT(*) FROM ordered WHERE n<=%s)=%s
+      AND NOT EXISTS(
+        SELECT 1 FROM _ack_expected x LEFT JOIN ordered o ON o.n=x.idx+1
+         WHERE o.n IS NULL
+            OR lower(hex(CAST(o.team AS BLOB)))!=x.team_hex
+            OR lower(hex(CAST(o.from_agent AS BLOB)))!=x.from_hex
+            OR lower(hex(CAST(o.to_agent AS BLOB)))!=x.to_hex
+            OR lower(hex(CAST(o.at AS BLOB)))!=x.at_hex
+            OR CASE o.src WHEN 1 THEN 'event' ELSE 'legacy' END!=x.source
+            OR o.ord!=x.source_ord
+            OR lower(hex(CAST(o.id AS BLOB)))!=x.id_hex
+            OR lower(hex(CAST(o.body AS BLOB)))!=x.body_hex)
+      THEN 1 ELSE 0 END;\n" "$selected" "$selected" "$selected"
+    printf "INSERT INTO _ack_guard SELECT CASE WHEN NOT EXISTS(
+      SELECT 1 FROM _ack_expected x
+      JOIN events e ON x.source='event' AND e.seq=x.source_ord
+      LEFT JOIN messages m ON m.id=e.legacy_id
+      WHERE e.legacy_id IS NOT NULL AND (
+        m.id IS NULL
+        OR lower(hex(CAST(m.team AS BLOB)))!=x.team_hex
+        OR lower(hex(CAST(m.from_agent AS BLOB)))!=x.from_hex
+        OR lower(hex(CAST(m.to_agent AS BLOB)))!=x.to_hex
+        OR lower(hex(CAST(m.body AS BLOB)))!=x.body_hex
+        OR lower(hex(CAST(m.created_at AS BLOB)))!=x.at_hex))
+      THEN 1 ELSE 0 END;\n"
+    printf "DELETE FROM receipt_nonces WHERE expires_at < CAST(strftime('%%s','now') AS INTEGER)-86400;\n"
+    printf "INSERT INTO receipt_nonces(nonce,payload_sha256,store_generation,team_sha256,recipient_sha256,batch_sha256,frame_sha256,expires_at,committed_at) VALUES('%s','%s','%s','%s','%s','%s','%s',%s,CAST(strftime('%%s','now') AS INTEGER));\n" \
+      "$nonce" "$payload_sha" "$generation" "$team_sha" "$recipient_sha" \
+      "$batch_sha" "$frame_sha" "$expires"
+    printf "INSERT INTO events(type,id,team,agent,msg_id,at)
+      SELECT 'message_read','receipt-v1:%s:' || idx,'%s','%s',
+             id_value,strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now')
+        FROM _ack_expected ORDER BY idx;\n" "$nonce" "$tl" "$al"
+    printf "UPDATE messages SET read_at=strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now')
+      WHERE rowid IN (SELECT source_ord FROM _ack_expected WHERE source='legacy');\n"
+    printf "UPDATE messages SET read_at=strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ','now')
+      WHERE id IN (
+        SELECT m.id FROM events e JOIN _ack_expected x
+          ON x.source='event' AND e.seq=x.source_ord
+         AND lower(hex(CAST(e.id AS BLOB)))=x.id_hex
+         AND lower(hex(CAST(e.body AS BLOB)))=x.body_hex
+        JOIN messages m ON m.id=e.legacy_id
+         AND lower(hex(CAST(m.team AS BLOB)))=x.team_hex
+         AND lower(hex(CAST(m.from_agent AS BLOB)))=x.from_hex
+         AND lower(hex(CAST(m.to_agent AS BLOB)))=x.to_hex
+         AND lower(hex(CAST(m.body AS BLOB)))=x.body_hex
+         AND lower(hex(CAST(m.created_at AS BLOB)))=x.at_hex);\n"
+    printf "INSERT OR IGNORE INTO read_cursors(team,agent,local_position) VALUES('%s','%s',0);\n" "$tl" "$al"
+    printf "UPDATE read_cursors SET local_position=MAX(local_position,MIN(%s,
+      COALESCE((SELECT MIN(e.seq)-1 FROM events e
+        WHERE e.type='message_sent' AND e.team='%s' AND e.to_agent='%s' AND e.seq<=%s
+          AND NOT EXISTS(SELECT 1 FROM events r WHERE r.type='message_read'
+            AND r.team=e.team AND r.agent='%s' AND r.msg_id=e.id)),%s)))
+      WHERE team='%s' AND agent='%s';\n" "$frontier" "$tl" "$al" "$frontier" "$al" "$frontier" "$tl" "$al"
+    # SQLite pauses here with BEGIN IMMEDIATE and every intended write still
+    # uncommitted. The parent shell reruns the same closed claim predicate,
+    # writes one private allow/deny verdict, and only then lets this stream
+    # reach COMMIT. The verdict guard is the only statement between that
+    # external recheck and COMMIT; a deny or missing verdict trips .bail on.
+    printf '.shell /bin/bash "$AGMSG_RECEIPT_GATE_SCRIPT"\n'
+    printf "INSERT INTO _ack_guard VALUES(CASE WHEN CAST(readfile('%s') AS TEXT)='allow' THEN 1 ELSE 0 END);\n" "$verdict_lit"
+    printf 'COMMIT;\n'
+  } >"$sql" || { /bin/rm -rf -- "$tmp" 2>/dev/null || true; return 13; }
+
+  local AGMSG_RECEIPT_GATE_SCRIPT="$gate"
+  local AGMSG_RECEIPT_GATE_WAITING="$waiting"
+  local AGMSG_RECEIPT_GATE_VERDICT="$verdict"
+  local AGMSG_RECEIPT_GATE_PARENT_PID="$_AGMSG_RECEIPT_GATE_PARENT_PID"
+  local AGMSG_RECEIPT_INSTANCE_ID_LIB="$_AGMSG_RECEIPT_LIB_DIR/instance-id.sh"
+  export AGMSG_RECEIPT_GATE_SCRIPT AGMSG_RECEIPT_GATE_WAITING AGMSG_RECEIPT_GATE_VERDICT \
+    AGMSG_RECEIPT_GATE_PARENT_PID AGMSG_RECEIPT_INSTANCE_ID_LIB
+  LC_ALL=C agmsg_sqlite -batch "$db" <"$sql" >"$output" 2>"$error" 3>&- 4>&- &
+  sqlite_pid=$!
+  attempt=0
+  while [ ! -f "$waiting" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt 1000 ] || ! _agmsg_pid_alive_local "$sqlite_pid"; then
+      break
+    fi
+    sleep 0.01
+  done
+
+  if [ -f "$waiting" ]; then
+    if _agmsg_receipt_capability_claim_check "$team"; then
+      claim_rc=0
+      result=allow
+    else
+      claim_rc=$?
+      result=deny
+    fi
+    verdict_tmp="${verdict}.tmp.$$"
+    _sqlite_receipt_publish_verdict "$verdict" "$result" "$verdict_tmp" || verdict_rc=13
+  else
+    verdict_tmp="${verdict}.tmp.$$"
+    _sqlite_receipt_publish_verdict "$verdict" deny "$verdict_tmp" 2>/dev/null || true
+  fi
+
+  if wait "$sqlite_pid"; then rc=0; else rc=$?; fi
+  result="$(/bin/cat "$output" "$error" 2>/dev/null)"
+  if [ "$claim_rc" -ne 0 ]; then
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    return 76
+  fi
+  if [ "$verdict_rc" -ne 0 ]; then
+    /bin/rm -rf -- "$tmp" 2>/dev/null || true
+    return 77
+  fi
+  /bin/rm -rf -- "$tmp" 2>/dev/null || return 13
+  [ "$rc" -eq 0 ] && [ -z "$result" ] && return 0
+  case "$result" in
+    *'database is locked'*|*'database table is locked'*|*'database schema is locked'*) return 75 ;;
+    *) return 13 ;;
+  esac
+}
+
+
+_sqlite_receipt_parse_args() {
+  local issue=0 arg
+  local -a filtered
+  filtered=()
+  for arg in "$@"; do
+    if [ "$arg" = --issue-receipt ]; then
+      [ "$issue" -eq 0 ] || {
+        printf 'storage: duplicate --issue-receipt option\n' >&2
+        return 13
+      }
+      issue=1
+    else
+      filtered[${#filtered[@]}]="$arg"
+    fi
+  done
+  _AGMSG_RECEIPT_ISSUE_REQUESTED="$issue"
+  _agmsg_bounded_parse_args "${filtered[@]}"
+}
+
+_sqlite_receipt_parse_show_args() {
+  local issue=0 arg
+  local -a filtered
+  filtered=()
+  for arg in "$@"; do
+    if [ "$arg" = --issue-receipt ]; then
+      [ "$issue" -eq 0 ] || {
+        printf 'storage: duplicate --issue-receipt option\n' >&2
+        return 13
+      }
+      issue=1
+    else
+      filtered[${#filtered[@]}]="$arg"
+    fi
+  done
+  _AGMSG_RECEIPT_ISSUE_REQUESTED="$issue"
+  _agmsg_bounded_parse_show_args "${filtered[@]}"
+}
+
+_sqlite_receipt_issue_preflight() {
+  local team="$1" recipient="$2"
+  if ! agmsg_validate_team_name "$team" >/dev/null 2>&1 ||
+     ! agmsg_validate_agent_name "$recipient" >/dev/null 2>&1; then
+      _agmsg_receipt_error 'invalid receipt scope'
+      return 13
+  fi
+  _agmsg_receipt_platform || return $?
+  _agmsg_receipt_validate_store "$team" || return $?
+  agmsg_receipt_resolve_runtime || return $?
+  _agmsg_receipt_capability_claim_check "$team" || return $?
+  _agmsg_receipt_validate_ready "$team" || return $?
+}
+
+# Optional SQLite-only ABI. Success is deliberately silent; every refusal has
+# zero stdout and one bounded receipt diagnostic.
+storage_ack_receipt() {
+  local team="${1-}" recipient="${2-}" flag="${3-}" token="${4-}"
+  [ "$#" -eq 4 ] && [ "$flag" = --receipt ] && [ -n "$token" ] || {
+    _agmsg_receipt_ack_diagnostic invalid
+    return 13
+  }
+  [ "${#token}" -le 2048 ] || { _agmsg_receipt_ack_diagnostic invalid; return 13; }
+  case "$token" in
+    *.*) ;;
+    *) _agmsg_receipt_ack_diagnostic invalid; return 13 ;;
+  esac
+  [ -n "${token%%.*}" ] && [ -n "${token#*.}" ] || {
+      _agmsg_receipt_ack_diagnostic invalid
+      return 13
+    }
+  case "${token#*.}" in
+    *.*) _agmsg_receipt_ack_diagnostic invalid; return 13 ;;
+  esac
+  if ! agmsg_validate_team_name "$team" >/dev/null 2>&1 ||
+     ! agmsg_validate_agent_name "$recipient" >/dev/null 2>&1; then
+    _agmsg_receipt_ack_diagnostic scope
+    return 13
+  fi
+  _agmsg_receipt_platform || return $?
+  _agmsg_receipt_validate_store "$team" || return $?
+  # Preserve the closed shared claim predicate's exact refusal diagnostic.
+  _agmsg_receipt_capability_claim_check "$team" || return $?
+  _agmsg_receipt_ack "$team" "$recipient" "$token"
+}
+
 _sqlite_bounded_public_result() {
   local output="$1" expected="$2" on_overflow="${3:-0}" first rest
   first="$(printf '%s\n' "$output" | sed -n '1p')"
@@ -667,8 +1127,22 @@ storage_unread_summary() {
 storage_list_unread_bounded() {
   local team="$1" agent="$2" db output
   shift 2
-  _agmsg_bounded_parse_args "$@" || return 13
+  _sqlite_receipt_parse_args "$@" || return 13
   db="$(_sqlite_db "$team")" || return 13
+  if [ "$_AGMSG_RECEIPT_ISSUE_REQUESTED" -eq 1 ]; then
+    [ -f "$db" ] && [ -r "$db" ] || {
+      _agmsg_receipt_error 'receipt state is not initialized'
+      return 13
+    }
+    _sqlite_receipt_issue_preflight "$team" "$agent" || return $?
+    output="$(_sqlite_data "$team" "$(_sqlite_receipt_list_sql "$team" "$agent" "$_AGMSG_BOUNDED_LIMIT" "$_AGMSG_BOUNDED_MAX_BODY_BYTES" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")")" || return 13
+    case "$(printf '%s\n' "$output" | sed -n '1p')" in
+      '{"type":"__agmsg_bounded_status","status":"ok"}') ;;
+      *) _agmsg_receipt_error 'receipt snapshot validation failed'; return 13 ;;
+    esac
+    printf '%s\n' "$output" | tail -n +2 | _agmsg_receipt_issue_stream "$team" "$agent"
+    return $?
+  fi
   if [ ! -e "$db" ] && [ ! -L "$db" ]; then
     _agmsg_bounded_emit_records "{\"type\":\"bounded_unread_result\",\"selected_count\":0,\"selected_body_bytes\":0,\"remaining_count\":0,\"remaining_body_bytes\":0,\"limit_items\":$_AGMSG_BOUNDED_LIMIT,\"max_body_bytes\":$_AGMSG_BOUNDED_MAX_BODY_BYTES}"
     return $?
@@ -689,8 +1163,25 @@ storage_get_message_bounded() {
   local team="$1" agent="$2" message_id="$3" db output first rest
   shift 3
   [ -n "$message_id" ] || { printf 'storage: message id is required\n' >&2; return 13; }
-  _agmsg_bounded_parse_show_args "$@" || return 13
+  _sqlite_receipt_parse_show_args "$@" || return 13
   db="$(_sqlite_db "$team")" || return 13
+  if [ "$_AGMSG_RECEIPT_ISSUE_REQUESTED" -eq 1 ]; then
+    [ -f "$db" ] && [ -r "$db" ] || {
+      _agmsg_receipt_error 'receipt state is not initialized'
+      return 13
+    }
+    _sqlite_receipt_issue_preflight "$team" "$agent" || return $?
+    # The opaque ID is already the public show selector, but it still must not
+    # be copied into sqlite3's process argv. The receipt-only statement goes
+    # over stdin; ordinary phase-1 show remains byte-for-byte unchanged.
+    output="$(_sqlite_data_stdin "$team" "$(_sqlite_receipt_show_sql "$team" "$agent" "$message_id" "$_AGMSG_BOUNDED_MAX_BODY_BYTES" "$_AGMSG_BOUNDED_MAX_RECORD_BYTES")")" || return 13
+    case "$(printf '%s\n' "$output" | sed -n '1p')" in
+      '{"type":"__agmsg_bounded_status","status":"ok"}') ;;
+      *) _agmsg_receipt_error 'receipt show requires the first unread row'; return 13 ;;
+    esac
+    printf '%s\n' "$output" | tail -n +2 | _agmsg_receipt_issue_stream "$team" "$agent"
+    return $?
+  fi
   if [ ! -e "$db" ] && [ ! -L "$db" ]; then
     printf 'storage: message not found\n' >&2
     return 13

@@ -521,6 +521,26 @@ bats tests/    # bats-coreが必要: brew install bats-core
 - **デーモンなし**: 直接ファイルシステムアクセス
 - **ネットワークなし**: すべてローカル
 
+### fork限定のoptional SQLite receipt capability
+
+bundled SQLite driverは、オプトインのreceipt-bound acknowledgement ABIを
+含む。現在のinbox、watcher、hook、delivery、JSONL pathはこれを呼び出さない。
+receipt init・issue・ackにはOpenSSL 3と`xxd`も必要で、Git Bash/Windowsでは
+非対応である。上記の通常経路は既存のplatform supportを維持する。
+
+closed claim predicateは操作開始時と、receipt transactionを開いた状態で
+commitする直前に再検査する。外部claim authorityはSQLiteとatomicではないため、
+claim/install/update保守をreceipt操作と並行してはならず、残存TOCTOUがある。
+これはhard-atomic claim interlockではない。
+
+このfork capabilityをmergeしても、install、dependency pin、live activationは
+承認されない。先に`cattyneo/.agents#220`を完了する必要がある。将来別途承認された
+rolloutでは検証済みmerge commitへpinし、rollback時はoptional receipt呼び出しを
+止め、key・nonce・schema evidenceを保持する。同等のupstream契約、同等tests、
+owner承認済みmigration・claim-precedence planが揃うまでfork差分を撤去しない。
+wire詳細は[ADR 0005](docs/adr/0005-sqlite-receipt-ack.md)と
+[driver interface](docs/spec/driver-interface.ja.md#212-optional-sqlite-receipt-acknowledgementfork-order-2b-phase-2)を参照。
+
 ## プラグイン
 
 agmsgのプラグイン可能な単位は軸（axis）ごとにグループ化された**ドライバー**だ（`types` はエージェントランタイム、`storage` と `delivery` は今後追加予定）。組み込みは `scripts/drivers/` 配下にあり、`<skill>/plugins/<axis>/<name>/` 配下（または `AGMSG_PLUGIN_DIRS` が指すディレクトリ）に自分のものを置くことで、フォークせずにagmsgを拡張できる。
